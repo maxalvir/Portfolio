@@ -9,7 +9,7 @@ Welcome! I'm a Sports Analytics major at Syracuse University passionate about ap
 - Modeled game script and opponent strength for robust predictive outputs.
 - Designed visuals for accuracy comparison and decision support.
 
-[View Project Code](#link) — [Model Overview PDF](#link)
+[View Project Code](#link) — [Fantasy Football Projections Thesis.pdf](https://github.com/user-attachments/files/20617516/Fantasy.Football.Projections.Thesis.pdf)
 
 ---
 
