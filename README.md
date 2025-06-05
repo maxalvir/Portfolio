@@ -19,7 +19,7 @@ Welcome! I'm a Sports Analytics major at Syracuse University passionate about ap
 - Created a normalized Value Score and contract-adjusted rankings.
 - Visualized role-based archetypes and identified market inefficiencies.
 
-[View Code](RBValueProj.rmd) — [Model Summary PDF](#link)
+[View Code](RBValueProj.rmd)
 
 ---
 
