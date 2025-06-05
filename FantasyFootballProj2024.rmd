@@ -1,0 +1,928 @@
+library(sjPlot)
+library(ggplot2)
+library(stargazer)
+library(car)
+library(carData)
+library(HH)
+library(skedastic)
+library(sandwich)
+library(lmtest)
+library(plm)
+library(gridExtra)
+library(tseries)
+library(tidyverse)
+library(GGally)
+library(ggfortify)
+library(reshape2)
+library(vtable)
+library(randomForest)
+library(dplyr)
+library(brms)
+library(bayestestR)
+library(forecast)
+library(caret)
+library(e1071)
+library(stargazer)
+library(gt)
+library(broom)
+install.packages("insight", dependencies = TRUE)
+
+setwd("~/")
+data <- read.csv("Preseason2024rbs.csv")
+newdata <- read.csv("Preseason2024wrs.csv")
+ppg_2024 <- read.csv("RegSeasonFantasy2024.csv")
+
+view(data)
+#Summary Stats
+sumtable(data,
+         summ=c('mean(x)',
+                'median(x)',
+                'sd(x)',
+                'min(x)',
+                'max(x)'))
+sumtable(newdata,
+         summ=c('mean(x)',
+                'median(x)',
+                'sd(x)',
+                'min(x)',
+                'max(x)'))
+
+# Filter the data to include only players with PPG >= 4
+data_filter <- data %>% filter(PPG <= 4)
+
+# Create scatter plots with trend lines
+p1 <- ggplot(data_filter, aes(x = Oline, y = PPG, label = Player)) +
+  geom_point(color = "blue") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  geom_text(vjust = -0.5, hjust = 0.5, size = 3) +
+  labs(title = "Correlation: O line rank vs Points per game", x = "O Line", y = "PPG") +
+  theme_minimal()
+
+p2 <- ggplot(data_filter, aes(x = Implied.Touches, y = PPG, label = Player)) +
+  geom_point(color = "red") +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  geom_text(vjust = -0.5, hjust = 0.5, size = 3) + 
+  labs(title = "Correlation: Implied Touches vs Points Per Game", x = "Implied Touches", y = "PPG") +
+  theme_minimal()
+
+# Display plots side by side
+grid.arrange(p1, p2, ncol = 2)
+
+
+
+# View the first few rows to ensure it's loaded correctly
+head(data)
+head(newdata)
+# Check the structure of the dataset
+str(data)
+str(newdata)
+# Get summary statistics for the dataset
+summary(data)
+# Replace "#N/A" with NA in the entire dataset
+data[data == "#N/A"] <- NA
+newdata[newdata == "#N/A"] <- NA
+ppg_2024[ppg_2024 == "N/A"] <- NA
+# Convert the percentage column to numeric
+data$X20._Rush <- as.numeric(sub("%", "", data$X20._Rush)) / 100
+
+# Fit the linear regression model
+model <- lm(PPG ~ Avg.Snap + GZ_Att + Implied.Touches + TDs + Scrim.Yards + X20._Rush + Oline + SOS, data = data)
+newmodel <- lm(Proj.Pts ~ Tgt.PG + Total.AY + Avg.Snaps + Routes.Run_PG + YAC + TDs + WOPR + RZ.TGT + PROE, data = newdata)
+
+# View the summary of the model
+summary(model)
+summary(newmodel)
+stargazer(model, newmodel, type = "text")
+stargazer(model, newmodel, type = "html", out = "lmmodels_output.html")
+
+# Tidy and combine models
+tidy1 <- tidy(model)
+tidy2 <- tidy(newmodel)
+
+models_df <- bind_rows(
+  tidy1 %>% mutate(model = "RBs"),
+  tidy2 %>% mutate(newmodel = "WRs")
+)
+
+# Nicer Table for Output
+models_df %>%
+  gt() %>%
+  tab_header(title = "Regression Results") %>%
+  fmt_number(columns = c(estimate, std.error, statistic, p.value), decimals = 3)
+
+# Check how many NA values each column has
+colSums(is.na(data))
+colSums(is.na(newdata))
+colSums(is.na(ppg_2024))
+# Remove columns where more than 50% of values are NA
+data <- data %>% select(where(~ mean(is.na(.)) < 0.5))
+newdata <- newdata %>% select(where(~ mean(is.na(.)) < 0.5))
+ppg_2024 <- ppg_2024 %>% select(where(~ mean(is.na(.)) < 0.5))
+# Fill NA values with the column mean (for numerical columns only)
+data <- data %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+newdata <- newdata %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+ppg_2024 <- ppg_2024 %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.), mean(., na.rm = TRUE), .)))
+# Ensure response variable does not have NA values
+data <- data %>% filter(!is.na(PPG))
+newdata <- newdata %>% filter(!is.na(Proj.Pts))
+ppg_2024 <- ppg_2024 %>% filter(!is.na(X2024PPG))
+# Check if response variable has enough unique values
+print(unique(data$PPG))
+print(unique(newdata$Proj.Pts))
+print(unique(ppg_2024$X2024PPG))
+
+str(data)  # Check structure of data
+sapply(data, class)  # Check each column's data type
+data$PPG <- as.numeric(as.character(data$PPG))  # Convert PPG to numeric
+newdata$Proj.Pts <- as.numeric(as.character(newdata$Proj.Pts))  # Convert PPG to numeric
+ppg_2024$X2024PPG <- as.numeric(as.character(ppg_2024$X2024PPG))  # Convert PPG to numeric
+
+# Predict PPG for the existing players in the RB data
+predicted_ppg <- predict(model, data)
+data$Predicted_PPG <- predicted_ppg
+
+# View the predictions
+print(data)
+
+# Predict Points for the existing players in the WR data 
+predicted_points <- predict(newmodel, newdata)
+newdata$Predicted_Points <- predicted_points
+# View the predictions
+print(newdata)
+
+#Shows highest player
+highest_ppg_player <- data[which.max(data$Predicted_PPG), ]
+print(highest_ppg_player)
+
+# Merge RB data with 2025 PPG data
+rbs_2024 <- data %>%
+  left_join(ppg_2024, by = "Player") %>%
+  rename(ppg_2024 = X2024PPG)  # Assuming your 2024 column is named "PPG"
+
+# Merge WR data with 2025 PPG data
+wrs_2024 <- newdata %>%
+  left_join(ppg_2024, by = "Player") %>%
+  rename(ppg_2024 = X2024PPG)  # Assuming your 2024 column is named "PPG"
+
+# After joining, you can examine the result to see what columns you have
+colnames(rbs_2024)
+colnames(wrs_2024)
+# Evaluate model performance
+data$Predicted_PPG <- as.numeric(as.character(data$Predicted_PPG))  # Convert PPG to numeric
+
+# Check the data types of both columns
+class(ppg_2024$X2024PPG)
+class(data$Predicted_PPG)
+
+# Check for NA values that might have been introduced during conversion
+sum(is.na(ppg_2024$X2024PPG))
+sum(is.na(data$Predicted_PPG))
+
+# Then try calculating MSE again
+mse <- mean((data$PPG - data$Predicted_PPG)^2, na.rm = TRUE)
+print(mse)
+mse <- mean((newdata$Proj.Pts - newdata$Predicted_Points)^2, na.rm = TRUE)
+print(mse)
+
+data[, c("Player", "Predicted_PPG")]
+data[, c("Predicted_PPG")]
+
+newdata[, c("Player", "Predicted_Points")]
+data[, c("Predicted_PPG")]
+
+# Train first Random Forest model (PPG Prediction)
+set.seed(42)  # For reproducibility
+rf_model1 <- randomForest(PPG ~ Avg.Snap + GZ_Att + Implied.Touches + TDs + Scrim.Yards + X20._Rush + Oline + SOS, 
+                          data = data, importance = TRUE, ntree = 500)
+
+# Train second Random Forest model (Projected Points Prediction)
+rf_model2 <- randomForest(Proj.Pts ~ Tgt.PG + Total.AY + Avg.Snaps + Routes.Run_PG + YAC + TDs + WOPR + RZ.TGT + PROE, 
+                          data = newdata, importance = TRUE, ntree = 500)
+
+# Print model summaries
+print(rf_model1)
+print(rf_model2)
+importance(rf_model1)
+importance(rf_model2)
+varImpPlot(rf_model1)
+varImpPlot(rf_model2)
+
+# Predict PPG for the existing players in the data
+predicted_ppg2 <- predict(rf_model1, data)
+data$Predicted_PPG2 <- predicted_ppg2
+newdata$Predicted_Points2 <- predict(rf_model2, newdata)
+
+# View the predictions
+print(data)
+print(newdata)
+
+# Then try calculating MSE again
+mse <- mean((data$PPG - data$Predicted_PPG2)^2, na.rm = TRUE)
+print(mse)
+mse <- mean((newdata$Proj.Pts - newdata$Predicted_Points2)^2, na.rm = TRUE)
+print(mse)
+
+# Convert importance to dataframe
+importance_df1 <- as.data.frame(importance(rf_model1))
+
+# Add row names as a new column for ggplot
+importance_df1$Predictor <- rownames(importance_df1)
+
+# Plot using the correct column name
+ggplot(importance_df1, aes(x = reorder(Predictor, IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  labs(title = "Feature Importance - PPG Model", x = "Predictor", y = "Importance") +
+  coord_flip() +  # Flip to horizontal for better readability
+  theme_minimal()
+
+# Convert importance to dataframe
+importance_df2 <- as.data.frame(importance(rf_model2))
+
+# Add row names as a new column for ggplot
+importance_df2$Predictor <- rownames(importance_df2)
+
+# Feature Importance for Model 2 (Projected Points Prediction)
+ggplot(importance_df2, aes(x = reorder(Predictor,IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat = "identity", fill = "red") +
+  labs(title = "Feature Importance - Projected Points Model", x = "Predictor", y = "Importance") +
+  theme_minimal()
+
+# Scatter plot: Actual vs Predicted PPG
+ggplot(data, aes(x = PPG, y = Predicted_PPG, label = Player)) +
+  geom_point(color = "blue", size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") + 
+  geom_text(vjust = -0.5, hjust = 0.5, size = 2, color = "black") +
+  labs(title = "Actual vs Predicted PPG", x = "Actual PPG", y = "Predicted PPG") +
+  theme_minimal()
+
+# Scatter plot: Actual vs Predicted Projected Points
+ggplot(newdata, aes(x = Proj.Pts, y = Predicted_Points2, label = Player)) +
+  geom_point(color = "red", size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") + 
+  geom_text(vjust = -0.5, hjust = 0.5, size = 2, color = "black") +
+  labs(title = "Actual vs Predicted Projected Points", x = "Actual Proj.Pts", y = "Predicted Proj.Pts") +
+  theme_minimal()
+
+# Bayesian Regression Model for PPG
+bayesian_model1 <- brm(
+  formula = PPG ~ Avg.Snap + GZ_Att + Implied.Touches + TDs + Scrim.Yards + SOS + 
+    Avg.Snap:Implied.Touches + Implied.Touches:Scrim.Yards + Oline:Scrim.Yards,
+  data = data,
+  family = gaussian(),  # Normal distribution for continuous response
+  prior = c(
+    prior(normal(0, 5), class = "b"),  # Prior for coefficients
+    prior(normal(0, 10), class = "Intercept"),  # Prior for intercept
+    prior(student_t(3, 0, 10), class = "sigma")  # Prior for residual error
+  ),
+  iter = 8000, warmup = 2000, chains = 4, cores = 4,
+  control = list(adapt_delta = 0.99)  # Helps with convergence
+)
+
+# Bayesian Regression Model for Projected Points
+bayesian_model2 <- brm(
+  formula = Proj.Pts ~ Tgt.PG + Total.AY + Avg.Snaps + Routes.Run_PG + YAC + TDs + WOPR + RZ.TGT + PROE + 
+    Routes.Run_PG:YAC + TDs:RZ.TGT + Total.AY:PROE + Avg.Snaps:PROE + Routes.Run_PG:Tgt.PG,
+  data = newdata,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 10), class = "b"),
+    prior(normal(0, 10), class = "Intercept"),
+    prior(student_t(3, 0, 10), class = "sigma")
+  ),
+  iter = 4000, warmup = 1000, chains = 4, cores = 4,
+  control = list(adapt_delta = 0.99)
+)
+
+summary(bayesian_model1)  # Check results for first model
+summary(bayesian_model2)  # Check results for second model
+
+plot(bayesian_model1)  # Trace plots and posterior distributions
+plot(bayesian_model2)
+
+pp_check(bayesian_model1, type = "error_hist")  #Posterior predictive checks
+pp_check(bayesian_model2)
+
+player_data <- data %>% filter(Player == "Bijan Robinson")
+predicted_ppg <- posterior_predict(bayesian_model1, newdata = player_data)
+mean(predicted_ppg)      # Expected PPG (posterior mean)
+median(predicted_ppg)    # Median PPG (robust estimate)
+quantile(predicted_ppg, probs = c(0.025, 0.975))  # 95% credible interval
+
+player_data_wr <- newdata %>% filter(Player == "Deebo Samuel")
+predicted_proj_pts <- posterior_predict(bayesian_model2, newdata = player_data_wr)
+mean(predicted_proj_pts)      # Expected projected points
+quantile(predicted_proj_pts, probs = c(0.025, 0.975))  # 95% CI
+
+# Predict PPG for the existing players in the data
+predicted_ppg3 <- predict(bayesian_model1, data)
+data$Predicted_PPG3 <- predicted_ppg3
+newdata$Predicted_Points3 <- predict(bayesian_model2, newdata)
+
+# View the predictions
+print(data)
+print(newdata)
+colnames(data)
+
+# Then try calculating MSE again
+mse <- mean((data$PPG - data$Predicted_PPG3[,"Estimate"])^2, na.rm = TRUE)
+print(mse)
+mse <- mean((newdata$Proj.Pts - newdata$Predicted_Points3[,"Estimate"])^2, na.rm = TRUE)
+print(mse)
+
+# Second Bayesian Model
+
+# SIMULATE OPPONENT DEFENSE STRENGTH
+# ================================
+set.seed(42)
+rb_data$OppDefensePointsAllowed <- runif(nrow(rb_data), min = 10, max = 30)
+wr_data$OppDefensePointsAllowed <- runif(nrow(wr_data), min = 10, max = 30)
+
+# Bin defense into Good/Average/Bad based on quantiles
+rb_data$DefenseStrength <- cut(rb_data$OppDefensePointsAllowed,
+                               breaks = quantile(rb_data$OppDefensePointsAllowed, probs = c(0, 0.33, 0.67, 1), na.rm = TRUE),
+                               labels = c("Good", "Average", "Bad"),
+                               include.lowest = TRUE)
+
+wr_data$DefenseStrength <- cut(wr_data$OppDefensePointsAllowed,
+                               breaks = quantile(wr_data$OppDefensePointsAllowed, probs = c(0, 0.33, 0.67, 1), na.rm = TRUE),
+                               labels = c("Good", "Average", "Bad"),
+                               include.lowest = TRUE)
+
+rb_data$DefenseStrength <- factor(rb_data$DefenseStrength, levels = c("Bad", "Average", "Good"))
+wr_data$DefenseStrength <- factor(wr_data$DefenseStrength, levels = c("Bad", "Average", "Good"))
+
+# ================================
+# SIMULATE WEEKLY DATA FOR RBs
+# ================================
+players_rb <- unique(rb_data$Player)[1:10]  # first 10 RBs
+weeks <- 1:5  # simulate 5 weeks
+
+rb_weekly_data <- expand.grid(Player = players_rb, Week = weeks) %>%
+  left_join(rb_data, by = "Player") %>%
+  mutate(
+    PPG = jitter(PPG, amount = 4),  # simulate weekly performance
+    OppDefensePointsAllowed = runif(n(), 10, 30),
+    DefenseStrength = cut(OppDefensePointsAllowed,
+                          breaks = quantile(OppDefensePointsAllowed, probs = c(0, 0.33, 0.67, 1), na.rm = TRUE),
+                          labels = c("Good", "Average", "Bad"),
+                          include.lowest = TRUE)
+  )
+
+rb_weekly_data$DefenseStrength <- factor(rb_weekly_data$DefenseStrength, levels = c("Bad", "Average", "Good"))
+
+# ================================
+# SIMULATE WEEKLY DATA FOR WRs
+# ================================
+players_wr <- unique(wr_data$Player)[1:10]
+wr_weekly_data <- expand.grid(Player = players_wr, Week = weeks) %>%
+  left_join(wr_data, by = "Player") %>%
+  mutate(
+    Proj.Pts = jitter(Proj.Pts, amount = 4),
+    OppDefensePointsAllowed = runif(n(), 10, 30),
+    DefenseStrength = cut(OppDefensePointsAllowed,
+                          breaks = quantile(OppDefensePointsAllowed, probs = c(0, 0.33, 0.67, 1), na.rm = TRUE),
+                          labels = c("Good", "Average", "Bad"),
+                          include.lowest = TRUE)
+  )
+
+wr_weekly_data$DefenseStrength <- factor(wr_weekly_data$DefenseStrength, levels = c("Bad", "Average", "Good"))
+
+# ================================
+# FIT BAYESIAN WEEKLY MODEL – RB
+# ================================
+rb_weekly_model <- brm(
+  formula = PPG ~ Avg.Snap + TDs + Scrim.Yards + Oline + SOS + DefenseStrength,
+  data = rb_weekly_data,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 10), class = "b"),
+    prior(normal(0, 10), class = "Intercept"),
+    prior(student_t(3, 0, 10), class = "sigma")
+  ),
+  iter = 3000, warmup = 1000, chains = 4, cores = 4,
+  control = list(adapt_delta = 0.95)
+)
+
+# ================================
+# FIT BAYESIAN WEEKLY MODEL – WR
+# ================================
+wr_weekly_model <- brm(
+  formula = Proj.Pts ~ Tgt.PG + Total.AY + Routes.Run_PG + YAC + TDs + DefenseStrength,
+  data = wr_weekly_data,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 10), class = "b"),
+    prior(normal(0, 10), class = "Intercept"),
+    prior(student_t(3, 0, 10), class = "sigma")
+  ),
+  iter = 3000, warmup = 1000, chains = 4, cores = 4,
+  control = list(adapt_delta = 0.95)
+)
+
+# ================================
+# PREDICT NEXT GAME – EXAMPLE FOR ONE RB
+# ================================
+next_rb <- rb_weekly_data %>%
+  filter(Player == "Bijan Robinson") %>%
+  tail(1)
+
+rb_pred <- predict(rb_weekly_model, newdata = next_rb)
+print(paste("📈 Predicted PPG for Bijan Robinson:", round(rb_pred[,"Estimate"], 2)))
+
+# ================================
+# PREDICT NEXT GAME – EXAMPLE FOR ONE WR
+# ================================
+next_wr <- wr_weekly_data %>%
+  filter(Player == "CeeDee Lamb") %>%
+  tail(1)
+
+wr_pred <- predict(wr_weekly_model, newdata = next_wr)
+print(paste("📈 Predicted PPG for CeeDee Lamb:", round(wr_pred[,"Estimate"], 2)))
+
+
+#Making a SARIMAX model
+
+# Clean column names
+names(rb_data) <- make.names(names(rb_data))
+names(wr_data) <- make.names(names(wr_data))
+
+# Ensure necessary columns are present
+rb_features <- c("Avg.Snap", "TDs", "Scrim.Yards", "Oline", "SOS", "Implied.Touches")
+wr_features <- c("Tgt.PG", "Total.AY", "Routes.Run_PG", "YAC", "TDs")
+
+# Forecast function for RBs
+predict_rb_ppg <- function(player_name, last_n = 10, h = 1) {
+  player_data <- rb_data %>% filter(Player == player_name)
+  
+  # Simulate past games — duplicate row if needed for demo
+  if (nrow(player_data) < last_n) {
+    player_data <- player_data[rep(1, last_n), ]  # replicate same stats
+  } else {
+    player_data <- tail(player_data, last_n)
+  }
+  
+  ts_data <- ts(player_data$PPG, frequency = 1)
+  xreg <- as.matrix(player_data[, rb_features])
+  
+  model <- auto.arima(ts_data, xreg = xreg)
+  forecasted <- forecast(model, xreg = tail(xreg, h), h = h)
+  
+  return(data.frame(Player = player_name, Predicted_PPG = as.numeric(forecasted$mean)))
+}
+
+# Forecast function for WRs
+predict_wr_ppg <- function(player_name, last_n = 10, h = 1) {
+  player_data <- wr_data %>% filter(Player == player_name)
+  
+  if (nrow(player_data) < last_n) {
+    player_data <- player_data[rep(1, last_n), ]
+  } else {
+    player_data <- tail(player_data, last_n)
+  }
+  
+  ts_data <- ts(player_data$Proj.Pts, frequency = 1)
+  xreg <- as.matrix(player_data[, wr_features])
+  
+  model <- auto.arima(ts_data, xreg = xreg)
+  forecasted <- forecast(model, xreg = tail(xreg, h), h = h)
+  
+  return(data.frame(Player = player_name, Predicted_PPG = as.numeric(forecasted$mean)))
+}
+
+# Run forecasts for all RBs and WRs
+rb_list <- unique(rb_data$Player)
+wr_list <- unique(wr_data$Player)
+
+rb_predictions <- bind_rows(lapply(rb_list, predict_rb_ppg))
+wr_predictions <- bind_rows(lapply(wr_list, predict_wr_ppg))
+
+# Show results
+print("RB Predictions")
+print(rb_predictions)
+
+print("WR Predictions")
+print(wr_predictions)
+
+# ---- Custom version of your SARIMAX RB forecaster ----
+predict_onerb_ppg <- function(player_name, actual_ppg_vec, h = 1) {
+  # Get the player’s row of features
+  player_row <- rb_data %>% filter(Player == player_name)
+  
+  if (nrow(player_row) == 0) {
+    return(data.frame(Player = player_name, Predicted_PPG = NA))
+  }
+  
+  n_games <- length(actual_ppg_vec)
+  
+  # Repeat the player's features n_games times
+  player_data <- player_row[rep(1, n_games), ]
+  player_data$PPG <- actual_ppg_vec
+  
+  ts_data <- ts(player_data$PPG, frequency = 1)
+  xreg <- as.matrix(player_data[, rb_features])
+  
+  # Add tiny noise to avoid optimizer error (constant columns)
+  xreg_jittered <- xreg + matrix(rnorm(length(xreg), 0, 0.0001), nrow = n_games)
+  
+  # Fit a simple manual ARIMA model
+  model <- Arima(ts_data, order = c(0, 1, 1), xreg = xreg_jittered)
+  
+  # Forecast using last row
+  next_xreg <- xreg_jittered[nrow(xreg_jittered), , drop = FALSE]
+  forecasted <- forecast(model, xreg = next_xreg, h = h)
+  
+  return(data.frame(Player = player_name, Predicted_PPG = as.numeric(forecasted$mean)))
+}
+
+#Predicts Bijan Robinson's next game based off last 10
+bijan_ppg <- c(26.1, 11.6, 19.2, 0.4, 19.8, 10.9, 27.3, 17.6, 5.9, 12.2)
+predict_onerb_ppg("Bijan Robinson", bijan_ppg)
+
+
+# Monte Carlo Simulation Model
+
+rb_data <- data
+wr_data <- newdata
+
+print(grep("Rush", colnames(rb_data), value = TRUE))
+print(grep("Tgt", colnames(wr_data), value = TRUE))
+
+print(colnames(rb_data))
+print(colnames(wr_data))
+
+print(head(data))                # Check if data exists
+print(colnames(data))            # Check available columns
+print(unique(data$Player))       # Check player names
+print(data[data$Player == "Derrick Henry", ])  # Check if the player exists
+
+simulate_player_performance <- function(data, player_name, is_rb = TRUE, n_simulations = 1000) {
+  if (!("Player" %in% colnames(data))) {
+    stop("Error: 'Player' column is missing in the dataset.")
+  }
+  
+  player_data <- data[data$Player == player_name, , drop = FALSE]
+  
+  if (nrow(player_data) == 0) {
+    cat("Error: Player", player_name, "not found in the dataset.\n")
+    return(NULL)
+  }
+  
+  ppg_col <- if (is_rb) player_data$PPG else player_data$Proj.Pts
+  
+  if (all(is.na(ppg_col))) {
+    cat("Error: No valid PPG data for", player_name, "\n")
+    return(NULL)
+  }
+  
+  mean_ppg <- mean(ppg_col, na.rm = TRUE)
+  sd_ppg <- sd(ppg_col, na.rm = TRUE)
+  
+  if (is.na(sd_ppg) || sd_ppg == 0) {
+    cat("Warning:", player_name, "has no variation in PPG. Using small standard deviation.\n")
+    sd_ppg <- 0.01
+  }
+  
+  simulated_ppg <- rnorm(n_simulations, mean = mean_ppg, sd = sd_ppg)
+  return(simulated_ppg)
+}
+
+cmc_simulations <- simulate_player_performance(rb_data, "Christian McCaffrey", is_rb = TRUE)
+ceedee_simulations <- simulate_player_performance(wr_data, "CeeDee Lamb", is_rb = FALSE)
+print(cmc_simulations)
+
+if (!is.null(cmc_simulations) && !is.null(ceedee_simulations)){
+  cat("Christian McCaffrey Simulated PPG:\n")
+  print(summary(cmc_simulations))
+  
+  cat("\nCeeDee Lamb Simulated Proj.Pts:\n")
+  print(summary(ceedee_simulations))
+  
+  hist(cmc_simulations, main="Christian McCaffrey PPG Simulation", xlab="Simulated PPG")
+  hist(ceedee_simulations, main="CeeDee Lamb Projected Points Simulation", xlab="Simulated Projected Points")
+}
+
+simulate_player_performance_with_xreg <- function(data, player_name, is_rb = TRUE, n_simulations = 1000) {
+  player_data <- data[data$Player == player_name, ]
+  
+  if (nrow(player_data) == 0) {
+    cat("Error: Player", player_name, "not found in the dataset.\n")
+    return(NULL)
+  }
+  
+  if (is_rb) {
+    ppg_col <- "PPG"
+    used_model <- model
+    regressors <- c("Avg.Snap", "GZ_Att", "Implied.Touches", "TDs", "Scrim.Yards", "X20._Rush", "Oline", "SOS")
+  } else {
+    ppg_col <- "Proj.Pts"
+    used_model <- newmodel
+    regressors <- c("Tgt.PG", "Total.AY", "Avg.Snaps", "Routes.Run_PG", "YAC", "TDs", "WOPR", "RZ.TGT", "PROE")
+  }
+  
+  # Check if regressors exist
+  missing_cols <- regressors[!(regressors %in% names(player_data))]
+  if (length(missing_cols) > 0) {
+    cat("Error: Missing columns -", paste(missing_cols, collapse = ", "), "\n")
+    return(NULL)
+  }
+  
+  # Ensure model exists
+  if (!exists("used_model") || is.null(used_model)) {
+    cat("Error: Model for", player_name, "is missing.\n")
+    return(NULL)
+  }
+  
+  # Extract only relevant columns
+  player_data <- player_data[, c(ppg_col, regressors)]
+  
+  # Compute mean values for regressors
+  new_data <- data.frame(lapply(player_data[, regressors, drop = FALSE], function(x) mean(x, na.rm = TRUE)))
+  
+  # Replace NaN values with 0
+  new_data[is.na(new_data)] <- 0
+  
+  print("New data for prediction:")
+  print(new_data)
+  
+  # Try predicting
+  prediction <- tryCatch({
+    predict(used_model, newdata = new_data)
+  }, error = function(e) {
+    cat("Error in predict():", e$message, "\n")
+    return(NULL)
+  })
+  
+  if (is.null(prediction)) {
+    return(NULL)
+  }
+  
+  # Generate random error from model residuals
+  error <- rnorm(1, mean = 0, sd = sd(used_model$residuals, na.rm = TRUE))
+  simulated_ppg <- prediction + error
+  
+  return(simulated_ppg)
+}
+
+
+cmc_simulations_adv <- simulate_player_performance_with_xreg(rb_data, "Christian McCaffrey", is_rb = TRUE)
+ceedee_simulations_adv <- simulate_player_performance_with_xreg(wr_data, "CeeDee Lamb", is_rb = FALSE)
+
+
+print(cmc_simulations_adv)
+print(ceedee_simulations_adv)
+
+# Once you've added the actual 2025 PPG data, let's prepare for modeling
+# Remove rows with missing actual PPG data
+rb_complete <- rbs_2024[!is.na(rbs_2024$ppg_2024), ]
+wr_complete <- wrs_2024[!is.na(wrs_2024$ppg_2024), ]
+
+# Define predictor variables for RB model
+rb_predictors <- c("Avg.Snap", "GZ_Att", "Implied.Touches", 
+                   "TDs", "Scrim.Yards", "X20._Rush", 
+                   "Oline", "SOS")
+
+# Define predictor variables for WR model
+wr_predictors <- c("Tgt.PG", "Total.AY", "Avg.Snaps", 
+                   "Routes.Run_PG", "YAC", "TDs", "WOPR", "RZ.TGT", 
+                   "PROE")
+
+# Now let's split into training and test sets
+# Setting seed for reproducibility
+set.seed(123)
+
+# For RB data
+rb_train_index <- createDataPartition(rb_complete$ppg_2024, p = 0.7, list = FALSE)
+rb_train <- rb_complete[rb_train_index, ]
+rb_test <- rb_complete[-rb_train_index, ]
+
+# For WR data
+wr_train_index <- createDataPartition(wr_complete$ppg_2024, p = 0.7, list = FALSE)
+wr_train <- wr_complete[wr_train_index, ]
+wr_test <- wr_complete[-wr_train_index, ]
+
+# 1. Linear Regression Models
+# For RBs
+rb_lm_model <- lm(model, data = rb_train)
+summary(rb_lm_model)
+
+# For WRs
+wr_lm_model <- lm(newmodel, data = wr_train)
+summary(wr_lm_model)
+
+# 2. Random Forest Models
+# For RBs
+rb_rf_model <- randomForest(
+  x = rb_train[, rb_predictors],
+  y = rb_train$ppg_2024,
+  ntree = 500,
+  importance = TRUE
+)
+print(rb_rf_model)
+varImpPlot(rb_rf_model)
+
+# For WRs
+wr_rf_model <- randomForest(
+  x = wr_train[, wr_predictors],
+  y = wr_train$ppg_2024,
+  ntree = 500,
+  importance = TRUE
+)
+print(wr_rf_model)
+varImpPlot(wr_rf_model)
+
+# 3. Bayesian Regression Models (using brms)
+# For RBs - we'll start with a simpler model for demonstration
+rb_bayes_model <- brm(
+  formula = PPG ~ Avg.Snap + GZ_Att + Implied.Touches + TDs + Scrim.Yards + SOS + 
+    Avg.Snap:Implied.Touches + Implied.Touches:Scrim.Yards + Oline:Scrim.Yards,
+  data = rb_train,
+  family = gaussian(),  # Normal distribution for continuous response
+  prior = c(
+    prior(normal(0, 5), class = "b"),  # Prior for coefficients
+    prior(normal(0, 10), class = "Intercept"),  # Prior for intercept
+    prior(student_t(3, 0, 10), class = "sigma")  # Prior for residual error
+  ),
+  iter = 8000, warmup = 2000, chains = 4, cores = 4,
+  control = list(adapt_delta = 0.99)  # Helps with convergence
+)
+summary(rb_bayes_model)
+
+# For WRs - simple model for demonstration
+wr_bayes_model <- brm(
+  formula = Proj.Pts ~ Tgt.PG + Total.AY + Avg.Snaps + Routes.Run_PG + YAC + TDs + WOPR + RZ.TGT + PROE + 
+    Routes.Run_PG:YAC + TDs:RZ.TGT + Total.AY:PROE + Avg.Snaps:PROE + Routes.Run_PG:Tgt.PG,
+  data = wr_train,
+  family = gaussian(),
+  prior = c(
+    prior(normal(0, 10), class = "b"),
+    prior(normal(0, 10), class = "Intercept"),
+    prior(student_t(3, 0, 10), class = "sigma")
+  ),
+  iter = 4000, warmup = 1000, chains = 4, cores = 4,
+  control = list(adapt_delta = 0.99)
+)
+summary(wr_bayes_model)
+
+# 4. Monte Carlo Simulation for prediction intervals
+# Function to evaluate Monte Carlo simulations against actual results
+evaluate_monte_carlo <- function(simulations, actual_value) {
+  mean_sim <- mean(simulations)
+  median_sim <- median(simulations)
+  lower_95 <- quantile(simulations, 0.025)
+  upper_95 <- quantile(simulations, 0.975)
+  
+  # Calculate error metrics
+  error <- mean_sim - actual_value
+  abs_error <- abs(error)
+  in_interval <- actual_value >= lower_95 && actual_value <= upper_95
+  
+  return(list(
+    mean_prediction = mean_sim,
+    median_prediction = median_sim,
+    lower_95 = lower_95,
+    upper_95 = upper_95,
+    error = error,
+    abs_error = abs_error,
+    in_95_interval = in_interval
+  ))
+}
+
+
+# Model Evaluation
+# Function to calculate evaluation metrics
+evaluate_model <- function(actual, predicted) {
+  rmse <- sqrt(mean((actual - predicted)^2))
+  mae <- mean(abs(actual - predicted))
+  r_squared <- 1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+  
+  return(data.frame(RMSE = rmse, MAE = mae, R_squared = r_squared))
+}
+
+# Evaluate linear models
+rb_lm_preds <- predict(rb_lm_model, newdata = rb_test)
+wr_lm_preds <- predict(wr_lm_model, newdata = wr_test)
+
+rb_lm_eval <- evaluate_model(rb_test$ppg_2024, rb_lm_preds)
+wr_lm_eval <- evaluate_model(wr_test$ppg_2024, wr_lm_preds)
+
+print(rb_lm_eval)
+print(wr_lm_eval)
+
+# Evaluate random forest models
+rb_rf_preds <- predict(rb_rf_model, newdata = rb_test)
+wr_rf_preds <- predict(wr_rf_model, newdata = wr_test)
+
+rb_rf_eval <- evaluate_model(rb_test$ppg_2024, rb_rf_preds)
+wr_rf_eval <- evaluate_model(wr_test$ppg_2024, wr_rf_preds)
+
+print(rb_rf_eval)
+print(wr_rf_eval)
+
+# Evaluate Bayesian models
+rb_bayes_preds <- predict(rb_bayes_model, newdata = rb_test)[, "Estimate"]
+wr_bayes_preds <- predict(wr_bayes_model, newdata = wr_test)[, "Estimate"]
+
+rb_bayes_eval <- evaluate_model(rb_test$ppg_2024, rb_bayes_preds)
+wr_bayes_eval <- evaluate_model(wr_test$ppg_2024, wr_bayes_preds)
+
+print(rb_bayes_eval)
+print(wr_bayes_eval)
+
+# Combine all evaluation results
+rb_eval_comparison <- rbind(
+  Linear = rb_lm_eval,
+  RandomForest = rb_rf_eval,
+  Bayesian = rb_bayes_eval
+)
+
+wr_eval_comparison <- rbind(
+  Linear = wr_lm_eval,
+  RandomForest = wr_rf_eval,
+  Bayesian = wr_bayes_eval
+)
+
+# Print comparison tables
+print("RB Model Comparison:")
+print(rb_eval_comparison)
+
+print("WR Model Comparison:")
+print(wr_eval_comparison)
+
+# Create visualizations of actual vs predicted values
+# For RB models
+rb_results <- data.frame(
+  Actual = rb_test$ppg_2024,
+  Linear = rb_lm_preds,
+  RandomForest = rb_rf_preds,
+  Bayesian = rb_bayes_preds,
+  Player = rb_test$Player
+)
+
+# Long format for ggplot
+rb_results_long <- pivot_longer(rb_results, 
+                                cols = c(Linear, RandomForest, Bayesian),
+                                names_to = "Model", 
+                                values_to = "Predicted")
+
+# Plot
+ggplot(rb_results_long, aes(x = Actual, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_text(aes(label = Player), hjust = -0.1, vjust = 0.1, size = 3, check_overlap = TRUE) +
+  facet_wrap(~ Model) +
+  labs(title = "Running Back Model Comparison",
+       x = "Actual 2025 PPG",
+       y = "Predicted 2025 PPG") +
+  theme_minimal()
+
+# For WR models
+wr_results <- data.frame(
+  Actual = wr_test$ppg_2024,
+  Linear = wr_lm_preds,
+  RandomForest = wr_rf_preds,
+  Bayesian = wr_bayes_preds,
+  Player = wr_test$Player
+)
+
+# Long format for ggplot
+wr_results_long <- pivot_longer(wr_results, 
+                                cols = c(Linear, RandomForest, Bayesian),
+                                names_to = "Model", 
+                                values_to = "Predicted")
+
+# Plot
+ggplot(wr_results_long, aes(x = Actual, y = Predicted, color = Model)) +
+  geom_point(alpha = 0.7) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed") +
+  geom_text(aes(label = Player), hjust = -0.1, vjust = 0.1, size = 3, check_overlap = TRUE) +
+  facet_wrap(~ Model) +
+  labs(title = "Wide Receiver Model Comparison",
+       x = "Actual 2025 PPG",
+       y = "Predicted 2025 PPG") +
+  theme_minimal()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

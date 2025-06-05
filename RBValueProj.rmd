@@ -1,0 +1,564 @@
+library(tidyverse)
+library(janitor)
+library(nflfastR)
+library(httr)
+library(rvest)
+library(jsonlite)
+library(rvest)
+library(stringr)
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(tidyr)
+library(factoextra)  # for visualization
+library(cluster)     # silhouette
+library(plotly)
+
+# Load data from 2024
+pbp <- load_pbp(2024)
+stats <- load_player_stats(2024) %>% clean_names()
+
+# Filter rushers with known player ID (primarily RBs)
+pbp_rush <- pbp %>%
+  filter(!is.na(rusher_player_id)) %>%
+  group_by(rusher_player_id, rusher_player_name, season, posteam) %>%
+  summarize(
+    total_rushes = sum(rush_attempt, na.rm = TRUE),
+    total_rushing_yards = sum(rushing_yards, na.rm = TRUE),
+    rush_tds = sum(rush_touchdown, na.rm = TRUE),
+    game_script = mean(score_differential, na.rm = TRUE),
+    total_plays = n(),
+    .groups = "drop"
+  ) %>%
+  rename(
+    player_id = rusher_player_id,
+    player_name = rusher_player_name,
+    team = posteam
+  )
+
+# Load and clean
+stats_rb <- load_player_stats(2024) %>%
+  clean_names() %>%
+  filter(position == "RB") %>%
+  group_by(player_id, player_display_name, season, recent_team) %>%
+  summarize(
+    games = n_distinct(week),
+    carries = sum(carries, na.rm = TRUE),
+    targets = sum(targets, na.rm = TRUE),
+    rushing_yards = sum(rushing_yards, na.rm = TRUE),
+    receiving_yards = sum(receiving_yards, na.rm = TRUE),
+    receptions = sum(receptions, na.rm = TRUE),
+    rushing_epa = sum(rushing_epa, na.rm = TRUE),
+    receiving_epa = sum(receiving_epa, na.rm = TRUE),
+    carries_per_game = sum(carries, na.rm = TRUE) / games,
+    targets_per_game = sum(targets, na.rm = TRUE) / games,
+    total_yards = rushing_yards + receiving_yards,
+    total_touches = carries + receptions,
+    yards_per_touch = total_yards / total_touches,
+    epa_per_play = (rushing_epa + receiving_epa) / (carries + targets),
+    .groups = "drop"
+  ) %>%
+  rename(team = recent_team)
+
+pbp_rush_clean <- pbp_rush %>%
+  group_by(player_id, player_name, season) %>%
+  arrange(player_id, desc(total_plays)) %>%
+  summarize(
+    team = last(team),
+    total_rushes = sum(total_rushes, na.rm = TRUE),
+    total_rushing_yards = sum(total_rushing_yards, na.rm = TRUE),
+    rush_tds = sum(rush_tds, na.rm = TRUE),
+    game_script = mean(game_script, na.rm = TRUE),  # avg over games
+    total_plays = sum(total_plays, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+stats_rb_clean <- stats_rb %>%
+  group_by(player_id, player_display_name, season) %>%
+  arrange(player_id, desc(games)) %>%  # if team with more games should be favored
+  summarize(
+    team = last(team),  # most recent team (from ordering)
+    games = sum(games, na.rm = TRUE),
+    carries = sum(carries, na.rm = TRUE),
+    targets = sum(targets, na.rm = TRUE),
+    rushing_yards = sum(rushing_yards, na.rm = TRUE),
+    receiving_yards = sum(receiving_yards, na.rm = TRUE),
+    receptions = sum(receptions, na.rm = TRUE),
+    rushing_epa = sum(rushing_epa, na.rm = TRUE),
+    receiving_epa = sum(receiving_epa, na.rm = TRUE),
+    carries_per_game = carries / games,
+    targets_per_game = targets / games,
+    total_yards = rushing_yards + receiving_yards,
+    total_touches = carries + receptions,
+    yards_per_touch = total_yards / total_touches,
+    epa_per_play = (rushing_epa + receiving_epa) / (carries + targets),
+    .groups = "drop"
+  )
+
+#Join the data sets
+rb_full <- full_join(stats_rb_clean, pbp_rush_clean, by = c("player_id", "season"))
+        
+setwd("~/SAL Thesis")
+rbsnaps <- read.csv("2024RBSnaps.csv")
+rbadvanced <- read.csv("2024RBAdvanced.csv")
+
+# Clean and match on player name
+rbsnaps <- rbsnaps %>%
+  clean_names() %>%
+  rename(player_display_name = player)
+
+# Join to existing rb_full
+rb_full <- rb_full %>%
+  left_join(rbsnaps, by = "player_display_name")
+
+# Clean and match on player name
+rbadvanced <- rbadvanced %>%
+  clean_names() %>%
+  rename(player_display_name = player)
+
+# Join to existing rb_full
+rb_full <- rb_full %>%
+  left_join(rbadvanced, by = "player_display_name")
+
+# Add QB Play and OLine RBlk Play based off PFF Grades
+qb_oline_context <- tibble::tibble(
+  team = c("ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE",
+           "DAL", "DEN", "DET", "GB", "HOU", "IND", "JAX", "KC",
+           "LV", "LAC", "LA", "MIA", "MIN", "NE", "NO", "NYG",
+           "NYJ", "PHI", "PIT", "SEA", "SF", "TB", "TEN", "WAS"),
+  season = 2024,
+  qb_grade = c(66.6, 82.8, 65.0, 66.9, 73.1, 65.6, 50.7, 50.2,
+               63.7, 67.5, 80.4, 60.9, 57.4, 76.9, 57.2, 71.9,
+               63.5, 61.6, 76.4, 55.8, 65.2, 45.6, 67.8, 59.7,
+               67.4, 76.9, 68.7, 80.0, 58.6, 64.7, 46.6, 54.8),
+  ol_grade = c(82.1, 74.3, 94.9, 91.9, 74.4, 67.6, 94.0, 73.4,
+               67.9, 78.3, 78.8, 75.8, 79.9, 62.2, 76.8, 83.9,
+               74.7, 91.2, 60.7, 70.2, 80.7, 70.1, 85.6, 53.6,
+               77.8, 81.6, 79.5, 82.5, 82.4, 85.9, 54.9, 90.6)
+)
+
+rb_full <- rb_full %>%
+  left_join(qb_oline_context, by = c("team.x" = "team", "season"))
+
+#Filter data only players with
+rb_full <- rb_full %>% filter(carries >= 37)
+rb_full <- rb_full %>%
+  select(-c(
+    player_name,
+    team.y,
+    team.x.x,
+    team.y.y,
+    age,
+    player_id
+  )) %>%
+  rename(c(player = player_display_name,TotalSnaps = ttl,AvgSnapPerGame = avg,))
+
+#replace NA data for 0 across dataset
+rb_full[is.na(rb_full)] <- 0
+
+# Subset of interest
+rb_subset <- rb_full %>%
+  select(player, AvgSnapPerGame, targets_per_game, carries_per_game, 
+         yards_per_touch, epa_per_play, rush_ybc, rush_yac, 
+         ybc_att, yac_att, brk_tkl, att_br, qb_grade, ol_grade, rushing_epa, receiving_epa) %>%
+  drop_na()
+
+# Reshape for faceted plots
+rb_long <- pivot_longer(rb_subset, -player)
+
+# Density plots
+ggplot(rb_long, aes(x = value)) +
+  geom_density(fill = "skyblue", alpha = 0.6) +
+  facet_wrap(~ name, scales = "free", ncol = 3) +
+  theme_minimal() +
+  ggtitle("Density Plots: Key Features")
+
+# Boxplots
+ggplot(rb_long, aes(x = name, y = value)) +
+  geom_boxplot(fill = "lightcoral") +
+  coord_flip() +
+  theme_minimal() +
+  ggtitle("Boxplots: Detecting Outliers")
+
+# Drop outliers to refine for clustering
+cluster_vars <- rb_full %>%
+  select(player, AvgSnapPerGame, targets_per_game, carries_per_game,
+         yards_per_touch, epa_per_play, ybc_att, yac_att, receiving_epa, 
+         rushing_epa, qb_grade, ol_grade ) %>%
+  drop_na()
+
+cluster_vars_avg <- cluster_vars %>%
+  group_by(player) %>%
+  summarise(across(everything(), mean, na.rm = TRUE))
+
+cluster_scaled <- cluster_vars_avg %>%
+  column_to_rownames("player") %>%
+  scale()
+
+# Elbow method (where the elbow dip starts to not become too steep)
+fviz_nbclust(cluster_scaled, kmeans, method = "wss") +
+  ggtitle("Elbow Method: Optimal K")
+
+# Silhouette method (dashed line shows how many clusters should be used)
+fviz_nbclust(cluster_scaled, kmeans, method = "silhouette") +
+  ggtitle("Silhouette Method: Optimal K")
+
+# Run k-means with k = 3
+set.seed(123)
+k3 <- kmeans(cluster_scaled, centers = 3, nstart = 25)
+
+# Add cluster labels back
+rb_clusters <- cluster_vars_avg %>%
+  mutate(cluster = k3$cluster)
+
+# View average profile of each cluster
+cluster_summary <- rb_clusters %>%
+  group_by(cluster) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+print(cluster_summary)
+
+# Create variable implied touches
+rb_clusters <- rb_clusters %>%
+  mutate(implied_touches = carries_per_game + targets_per_game)
+
+#Z-score each component within-cluster to focus on relative value.
+
+#So:
+  
+  #A back with high EPA relative to other backs in their usage group gets a positive z_epa
+
+#One with poor YAC/Att for his role gets a negative z_yac
+
+#This is essential to evaluate performance independently of role, since we're not comparing pass-catching backs directly to early-down grinders.
+
+rb_clusters <- rb_clusters %>%
+  group_by(cluster) %>%
+  mutate(
+    z_epa        = scale(epa_per_play),
+    z_yac        = scale(yac_att),
+    z_ytouch     = scale(yards_per_touch),
+    z_touch_vol  = scale(implied_touches),
+    z_oline      = scale(ol_grade),
+    z_qb         = scale(qb_grade)
+  ) %>%
+  ungroup()
+
+# value_score column that is cluster-relative, independent of game script or usage context.
+#High scores = RBs who are efficient and used: Low scores = inefficient or underused relative to their archetype
+rb_clusters <- rb_clusters %>%
+  mutate(
+    value_score = z_epa + z_yac + z_ytouch + z_touch_vol + z_oline + z_qb
+  )
+
+# We rescale the raw Value Score within each cluster so that: Worst-performing RB = 0, Best-performing RB = 10
+# This makes your output intuitive for decision-makers, e.g.: "This RB is an 8.7 out of 10 in his archetype", "He’s a poor bell cow (3.2 out of 10), but could thrive in a committee"
+rb_clusters <- rb_clusters %>%
+  group_by(cluster) %>%
+  mutate(
+    value_score_norm = scales::rescale(value_score, to = c(0, 10))
+  ) %>%
+  ungroup()
+
+# Labeling the clusters
+rb_clusters <- rb_clusters %>%
+  mutate(cluster_label = factor(cluster, labels = c("Volume-Heavy Bell Cows", "Explosive Dual-Threats", "Down-Hill Grinders")))
+
+gg <- ggplot(rb_clusters, aes(
+  x = AvgSnapPerGame,
+  y = value_score_norm,
+  color = cluster_label,
+  text = player
+)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "2024 NFL RB Clusters: Value Score vs. Usage",
+    x = "Avg Snaps per Game",
+    y = "RB Value Score (0–10)",
+    color = "RB Archetype"
+  ) +
+  scale_color_manual(values = c("red", "seagreen3", "dodgerblue")) +
+  theme_minimal()
+
+# Hover over dots to show player
+ggplotly(gg, tooltip = "text")
+
+# Weighting the Value score formula now
+rb_clusters <- rb_clusters %>%
+  mutate(
+    value_score2 = 0.35 * z_epa +
+      0.20 * z_yac +
+      0.175 * z_ytouch +
+      0.15 * z_touch_vol +
+      0.10 * z_oline +
+      0.025 * z_qb
+  )
+
+# Normalizing
+rb_clusters <- rb_clusters %>%
+  group_by(cluster) %>%
+  mutate(value_score2_norm = scales::rescale(value_score2, to = c(0, 10))) %>%
+  ungroup()
+
+# Second Plot with Weighted Formula
+gg <- ggplot(rb_clusters, aes(
+  x = AvgSnapPerGame,
+  y = value_score2_norm,
+  color = cluster_label,
+  text = player
+)) +
+  geom_point(size = 3, alpha = 0.8) +
+  labs(
+    title = "2024 NFL RB Clusters: Value Score vs. Usage",
+    x = "Avg Snaps per Game",
+    y = "RB Value Score (0–10)",
+    color = "RB Archetype"
+  ) +
+  scale_color_manual(values = c("red", "seagreen3", "dodgerblue")) +
+  theme_minimal()
+
+# Hover over dots to show player
+ggplotly(gg, tooltip = "text")
+
+# Moving on to find subtypes in the 3 clusters of RBs
+grinders <- rb_clusters %>%
+  filter(cluster_label == "Down-Hill Grinders") %>%
+  select(player, rushing_epa, ol_grade, yac_att) %>%
+  drop_na()
+
+grinder_scaled <- grinders %>%
+  column_to_rownames("player") %>%
+  scale()
+
+set.seed(123)
+grinder_k3 <- kmeans(grinder_scaled, centers = 3, nstart = 25)
+
+grinders$subtype <- factor(grinder_k3$cluster)
+
+grinders %>%
+  group_by(subtype) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+grinders$subtype <- factor(grinders$subtype, labels = c(
+  "YAC-Creator", "Context-Limited Grinder", "Replaceable"
+))
+
+# Rejoin to table
+rb_clusters <- rb_clusters %>%
+  left_join(grinders %>% select(player, grinder_subtype = subtype), by = "player")
+
+# Finding subtyoes for Bell Cows now
+bell_cows <- rb_clusters %>%
+  filter(cluster_label == "Volume-Heavy Bell Cows") %>%
+  mutate(implied_touches = carries_per_game + targets_per_game) %>%
+  select(player, epa_per_play, yards_per_touch, implied_touches, ol_grade, AvgSnapPerGame) %>%
+  drop_na()
+
+bell_scaled <- bell_cows %>%
+  column_to_rownames("player") %>%
+  scale()
+
+set.seed(123)
+bell_k3 <- kmeans(bell_scaled, centers = 2, nstart = 25)
+
+bell_cows$subtype <- factor(bell_k3$cluster)
+
+bell_cows %>%
+  group_by(subtype) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+bell_cows$subtype <- factor(bell_cows$subtype, labels = c(
+  "System-Boosted Bell Cow", "Volume-Driven Bell Cow"
+))
+
+# Rejoin to table
+rb_clusters <- rb_clusters %>%
+  left_join(bell_cows %>% select(player, bellcow_subtype = subtype), by = "player")
+
+# Finding sub types for Explosive Dual-Threats
+safety_valves <- rb_clusters %>%
+  filter(cluster_label == "Explosive Dual-Threats") %>%
+  select(player, targets_per_game, yac_att, yards_per_touch, receiving_epa, rushing_epa) %>%
+  drop_na()
+
+safety_scaled <- safety_valves %>%
+  column_to_rownames("player") %>%
+  scale()
+
+set.seed(123)
+safety_k <- kmeans(safety_scaled, centers = 3, nstart = 25)
+
+safety_valves$subtype <- factor(safety_k$cluster)
+
+safety_valves %>%
+  group_by(subtype) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+safety_valves$subtype <- factor(safety_valves$subtype, labels = c(
+  "Reliable Safety Valve", "Explosive Gadget Back", "Efficient Dual Weapon"))
+
+# Rejoin to table
+rb_clusters <- rb_clusters %>%
+  left_join(safety_valves %>% select(player, safety_subtype = subtype), by = "player")
+
+# Re make plot with 8 subtypes
+
+rb_clusters <- rb_clusters %>%
+  mutate(rb_subtype = coalesce(bellcow_subtype, safety_subtype, grinder_subtype))
+
+gg <- ggplot(rb_clusters, aes(
+  x = AvgSnapPerGame,
+  y = value_score_norm,
+  color = rb_subtype,
+  text = player
+)) +
+  geom_point(size = 3, alpha = 0.85) +
+  labs(
+    title = "2024 NFL RB Subtypes: Value Score vs. Usage",
+    x = "Avg Snaps per Game",
+    y = "RB Value Score (0–10)",
+    color = "RB Subtype"
+  ) +
+  theme_minimal()
+
+ggplotly(gg, tooltip = "text")
+
+# Work on Contract Efficiency and Backfield Optimization
+
+rb_contracts <- read.csv("2024RBContracts.csv")
+rb_contracts$APY <- as.numeric(gsub(",", "", gsub("\\$", "", rb_contracts$APY)))
+rb_contracts <- rb_contracts %>%
+  mutate(contract_percent_cap = APY / 255000000)
+rb_clusters <- rb_clusters %>%
+  left_join(rb_contracts, by = c("player" = "Player"))
+
+#Then we created a metric, “Contract Adjusted Value” (CAV) to evaluate a runningback’s
+#performance relative to their salary to determine their efficiency on the field relative to cost.
+rb_clusters <- rb_clusters %>%
+  mutate(
+    value_score_z = scale(value_score)[, 1],
+    contract_adj_value = (value_score_z^100) / contract_percent_cap / (10^100)
+  )
+
+gg <- ggplot(rb_clusters, aes(
+  x = contract_percent_cap * 100,
+  y = value_score_z,
+  color = rb_subtype,
+  text = player
+)) +
+  geom_point(size = 3, alpha = 0.85, position = position_jitter(width = 0.15, height = 0.1)) +
+  labs(
+    title = "2024 RB Value vs Contract Percent",
+    x = "Cap Hit (% of 2024 Cap)",
+    y = "RB Value Score (Z)",
+    color = "Subtype"
+  ) +
+  theme_minimal()
+
+ggplotly(gg, tooltip = "text")
+
+# To explore 3D clustering (e.g., efficiency + usage + salary):
+clust_input <- rb_clusters %>%
+  select(player, value_score_z, implied_touches, contract_percent_cap) %>%
+  drop_na()
+
+# Scale and cluster
+clust_scaled <- clust_input %>%
+  select(-player) %>%
+  scale()
+
+set.seed(123)
+k3_with_salary <- kmeans(clust_scaled, centers = 3, nstart = 25)
+
+# Add column to clust_input
+clust_input$contract_aware_cluster <- k3_with_salary$cluster
+
+# Summary of the 3 clusters
+clust_input %>%
+  group_by(contract_aware_cluster) %>%
+  summarise(across(everything(), mean), .groups = "drop")
+
+# Join clusters into full table once again
+rb_clusters <- rb_clusters %>%
+  left_join(clust_input %>% select(player, contract_aware_cluster), by = "player")
+
+ggplot(rb_clusters, aes(
+  x = implied_touches,
+  y = value_score_z,
+  size = contract_percent_cap * 100,
+  color = as.factor(contract_aware_cluster),
+  label = player
+)) +
+  geom_point(alpha = 0.8) +
+  scale_size_continuous(range = c(2, 10), name = "% of Cap") +
+  labs(
+    title = "RB Efficiency vs. Usage by Contract-Aware Cluster",
+    subtitle = "Z-Score of Value vs. Touches | Circle Size = Contract %",
+    x = "Implied Touches (Targets + Carries/Game)",
+    y = "Value Score (Z-Score)",
+    color = "Cluster"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position = "right",
+    plot.title = element_text(face = "bold")
+  )
+
+
+# Creating an optimal backfield for an NFL team
+backfield_candidates <- rb_clusters %>%
+  filter(rb_subtype %in% c("Volume-Driven Bell Cow", "Efficient Dual Weapon")) %>%
+  filter(!is.na(contract_percent_cap)) %>%
+  arrange(desc(value_score_norm))
+
+# One from each key role
+optimal_backfield <- backfield_candidates %>%
+  group_by(rb_subtype) %>%
+  slice_max(value_score_norm, n = 1) %>%
+  ungroup()
+
+# Add a best bargain as third
+bargain_back <- backfield_candidates %>%
+  arrange(contract_percent_cap) %>%
+  slice(1)
+
+# Shows the optimal backfield and the best budget back
+optimal_backfield <- bind_rows(optimal_backfield, bargain_back) %>%
+  distinct(player, .keep_all = TRUE)  # avoid duplicates
+
+# Simulate optimal backfield for random team (Cardinals)
+cardinals_fit <- rb_clusters %>%
+  filter(rb_subtype %in% c("Volume-Driven Bell Cow", "Efficient Dual Weapon")) %>%
+  filter(contract_percent_cap <= 0.03) %>% # Adjust based on cap budget for RBs
+  filter(receiving_epa >= 8) %>%  # Scheme-fit: 
+  arrange(desc(value_score_norm))
+
+# Top 2 different archetypes
+optimal_cardinals_backfield <- cardinals_fit %>%
+  group_by(rb_subtype) %>%
+  slice_max(value_score_norm, n = 1) %>%
+  ungroup() %>%
+  slice_head(n = 2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
