@@ -23,7 +23,8 @@ Welcome! I'm a Sports Analytics major at Syracuse University passionate about ap
 
 ---
 
-📄 [Maximus Alvir Resume.pdf](https://github.com/user-attachments/files/20617502/Maximus.Alvir.Resume.pdf)
+📄 [Maximus Alvir Resume.pdf](https://github.com/user-attachments/files/20664604/Maximus.Alvir.Resume.pdf)
+
 
 📬 Contact: maxalvir@aol.com | [LinkedIn](https://www.linkedin.com/in/maximusalvir)
 
