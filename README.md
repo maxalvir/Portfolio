@@ -18,6 +18,7 @@ Welcome! I'm a Sports Analytics major at Syracuse University passionate about ap
 - Used k-means clustering on usage, efficiency, and game context metrics.
 - Created a normalized Value Score and contract-adjusted rankings.
 - Visualized role-based archetypes and identified market inefficiencies.
+- Compared 2025 Draftees to NFL veterans based off clustering and Euclidean distance
 
 [View Code](RBValue_2025Draftees.rmd) - [Running Back Value.pdf](https://github.com/user-attachments/files/20664548/Running.Back.Value.pdf)
 
