@@ -24,6 +24,12 @@ Welcome! I'm a Sports Analytics major at Syracuse University passionate about ap
 
 ---
 
+## 📈 Spread Formation on 3/4down and short: Success Rate and Efficiency (In progress)
+- Manually gathering limited data presented to public and cleaning data
+- Implementing tablaeu and ggplot for various data visualazations
+
+---
+  
 📄 [Maximus Alvir Resume.pdf](https://github.com/user-attachments/files/20664604/Maximus.Alvir.Resume.pdf)
 
 
