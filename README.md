@@ -4,16 +4,6 @@ Welcome! I'm a Sports Analytics major at Syracuse University passionate about ap
 
 ---
 
-## 🏈 Fantasy Football Performance Modeling
-- Built weekly player projection models using R and Python (SARIMAX, Random Forest, Bayesian Inference).
-- Modeled game script and opponent strength for robust predictive outputs.
-- Designed visuals for accuracy comparison and decision support.
-
-[View Code](FantasyFootballProj2024.rmd)
- — [Fantasy Football Projections Thesis.pdf](https://github.com/user-attachments/files/20617516/Fantasy.Football.Projections.Thesis.pdf)
-
----
-
 ## 💸 Running Back Value & Role Classification
 - Used k-means clustering on usage, efficiency, and game context metrics.
 - Created a normalized Value Score and contract-adjusted rankings.
@@ -24,14 +14,28 @@ Welcome! I'm a Sports Analytics major at Syracuse University passionate about ap
 
 ---
 
-## 📈 Spread Formation on 3/4down and short: Success Rate and Efficiency (In progress)
-- Manually gathering limited data presented to public and cleaning data
-- Implementing tablaeu and ggplot for various data visualazations
+## 📈 Spread Formation Tactical Analysis Model 
+- Conducted a full-cycle analytics project using nflfastR and Sharp Football data to evaluate how spread 
+formations impact success on short yardage situations 
+- Engineered features such as spread_usage_pct, play type, formation, and previous play success; built 
+logistic regression models to predict red zone touchdown probability 
+- Visualized teams over/underperformance by comparing predicted vs. actual red zone TD rates
+
+[View Code](SpreadFormation.rmd) - [Spread Formation.pdf]()
+
+---
+
+## 🏈 Fantasy Football Performance Modeling
+- Built weekly player projection models using R and Python (SARIMAX, Random Forest, Bayesian Inference).
+- Modeled game script and opponent strength for robust predictive outputs.
+- Designed visuals for accuracy comparison and decision support.
+
+[View Code](FantasyFootballProj2024.rmd)
+ — [Fantasy Football Projections Thesis.pdf](https://github.com/user-attachments/files/20617516/Fantasy.Football.Projections.Thesis.pdf)
 
 ---
   
-📄 [Maximus Alvir Resume.pdf](https://github.com/user-attachments/files/20664604/Maximus.Alvir.Resume.pdf)
-
+📄 [Maximus Alvir 2 Resume.pdf](https://github.com/user-attachments/files/20785407/Maximus.Alvir.2.Resume.pdf)
 
 📬 Contact: maxalvir@aol.com | [LinkedIn](https://www.linkedin.com/in/maximusalvir)
 
