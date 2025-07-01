@@ -1,6 +1,6 @@
 # Maximus Alvir — Sports Analytics Portfolio
 
-Welcome! I'm a Sports Analytics major at Syracuse University passionate about applying data science to football strategy and roster building. Here's a look at my most impactful projects:
+Welcome! I'm a Sports Analytics graduate major at Syracuse University passionate about applying data science to football strategy and roster building. Here's a look at my most impactful projects:
 
 ---
 
