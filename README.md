@@ -21,7 +21,7 @@ formations impact success on short yardage situations
 logistic regression models to predict red zone touchdown probability 
 - Visualized teams over/underperformance by comparing predicted vs. actual red zone TD rates
 
-[View Code](SpreadAnalysis) - [Spread Formation Analysis.pdf](Spread Formation Tactical Analysis Model.pdf)
+[View Code](SpreadAnalysis) - [Spread Formation Analysis.pdf](https://github.com/maxalvir/Portfolio/blob/24bd5b024a45be8271e9a321f7e0786175ec208d/Spread%20Formation%20Tactical%20Analysis%20Model.pdf)
 
 ---
 
