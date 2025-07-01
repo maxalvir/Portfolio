@@ -1,0 +1,307 @@
+# Load libraries
+library(nflfastR)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(broom)
+library(nflverse)
+
+# Load data (example: 2021)
+pbp_2021 <- load_pbp(2021)
+sharpdata <- read_csv("shorttogo.csv")
+# could use this to view player stats View(load_player_stats(2021))
+
+# Create a summary based on data
+personnel_summary <- tibble::tibble(
+  Personnel = c("10 Rush", "10 Pass", "00 Rush", "00 Pass", "03 Pass", "All Rush", "All Pass"),
+  SuccessRate = c(0.67, 0.59, 0.60, 0.38, 0.00, 0.67, 0.51) 
+)
+
+# Plot
+ggplot(personnel_summary, aes(x = reorder(Personnel, SuccessRate), y = SuccessRate)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = scales::percent(SuccessRate, accuracy = 1)), hjust = -0.1, size = 4) +
+  coord_flip() +
+  labs(
+    title = "Success Rate by Personnel Grouping (3rd/4th Down, ≤5 Yards)",
+    x = "Personnel Grouping",
+    y = "Success Rate"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1))
+
+# Filter the nflfastR data down to 3/4 down with 5 yards to go, only runs and passes
+short_togo <- pbp_2021 %>%
+  filter(down == 3 | down == 4, ydstogo <= 5, !is.na(play_type)) %>%
+  filter(play_type %in% c("run", "pass")) %>%
+  select(posteam, game_id, play_type, down, ydstogo, success, epa, drive, series_success, series_result)
+
+# Grouping them by teams and play type, this finds the number of plays,
+# the mean of the success rate of the play and the EPA mean of the plays
+short_yardage <- short_togo %>%
+  group_by(posteam, play_type) %>%
+  summarise(
+    plays = n(),
+    success_rate = mean(success),
+    epa_per_play = mean(epa, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+short_togo <- short_togo %>%
+  rename(Team = posteam)
+short_yardage <- short_yardage %>%
+  rename(Team = posteam)
+
+sharpdata <- sharpdata %>%
+  mutate(
+    spread_total = `10PersonnelRush` + `10PersonnelPass` + 
+      `00PersonnelRush` + `00PersonnelPass` + 
+      `03Personnel`,
+    total_plays = `AllPersonnelRush` + `AllPersonnelPass`,
+    spread_usage_pct = spread_total / total_plays,
+    
+    spread_success_total = (`10PersonnelRush` * `10RushSuccess`) + 
+      (`10PersonnelPass` * `10PassSuccess`) + 
+      (`00PersonnelRush` * `00RushSuccess`) + 
+      (`00PersonnelPass` * `00PassSuccess`) + 
+      (`03Personnel` * `03PassSuccess`),
+    spread_success_rate = spread_success_total / spread_total
+  )
+
+epa_data <- left_join(short_yardage,sharpdata, by = "Team")
+
+ggplot(epa_data, aes(x = spread_usage_pct, y = epa_per_play)) +
+  geom_point(color = "darkblue") + 
+  geom_smooth(method = "lm") +
+  geom_smooth(se = FALSE, color = "red") + 
+  labs(
+    title = "Team EPA vs. Spread Usage on 3rd/4th Down (≤5 Yards)",
+    x = "Spread Usage % of 3rd/4th Down Plays",
+    y = "EPA per Play (All Personnel)"
+  )
+
+ggplot(epa_data, aes(x = success_rate, y = spread_success_rate)) +
+  geom_point(color = "forestgreen") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray") +
+  labs(
+    title = "Spread vs. Overall Success Rate",
+    x = "Overall Success Rate (All Personnel)",
+    y = "Spread Success Rate"
+  )
+
+# See what drives turned out successful after using spread formation
+drives_with_short <- short_togo %>%
+  distinct(game_id, drive, Team)
+drive_results <- short_togo %>%
+  select(game_id, drive, Team, series_success, series_result) %>%
+  distinct() %>%
+  inner_join(drives_with_short, by = c("game_id", "drive", "Team"))
+drive_summary <- drive_results %>%
+  group_by(Team, series_result) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  group_by(Team) %>%
+  mutate(pct = count / sum(count))%>%
+  filter(series_result %in% c("Field goal", "Touchdown", "End of half", "Punt", 
+                              "Turnover on downs", "Turnover", "Missed field goal", 
+                              "Opp touchdown"))
+
+ggplot(drive_summary, aes(x = reorder(Team, pct), y = pct, fill = series_result)) +
+  geom_col(position = "stack") +
+  coord_flip() +
+  labs(
+    title = "Drive Outcomes After Short-Yardage Situations (3rd/4th & ≤5)",
+    x = "Team",
+    y = "Proportion of Drives",
+    fill = "Drive Result"
+  ) +
+  scale_y_continuous(labels = scales::percent_format())
+
+# Tactical Diversity & Red Zone Efficiency
+redzone <- pbp_2021 %>%
+  filter(yardline_100 <= 20, play_type %in% c("run", "pass")) %>%
+  arrange(game_id, play_id) %>%  # Important for lag
+  group_by(game_id) %>%
+  mutate(
+    prev_success = lag(success),
+    pass = if_else(play_type == "pass", 1, 0),
+    under_center = if_else(shotgun == 0, 1, 0),
+    inside_10 = if_else(yardline_100 <= 10, 1, 0),
+    touchdown = if_else(touchdown == 1, 1, 0)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(prev_success))  # remove first play of each game or drive
+
+model_data <- redzone %>%
+  select(touchdown, down, yardline_100, pass, under_center, inside_10, prev_success) %>%
+  na.omit()
+
+model_glm <- glm(touchdown ~ down + yardline_100 + pass + under_center + inside_10 + prev_success,
+                 data = model_data, family = "binomial")
+
+summary(model_glm)
+
+# Tidy up the model
+tidy_model <- broom::tidy(model_glm) %>%
+  filter(term != "(Intercept)")
+
+# Plot log-odds
+ggplot(tidy_model, aes(x = reorder(term, estimate), y = estimate)) +
+  geom_col(fill = "darkblue") +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    title = "Effect Sizes (Log-Odds) for Red Zone TD Probability",
+    x = "Predictor",
+    y = "Coefficient Estimate (Log-Odds)"
+  ) +
+  theme_minimal()
+
+# add the predicted probabilities
+model_data$predicted_prob <- predict(model_glm, type = "response")
+
+# merge data to compare teams
+model_data_with_team <- model_data %>%
+  mutate(play_id = row_number()) %>%  # create ID
+  left_join(
+    redzone %>% mutate(play_id = row_number()) %>% select(play_id, posteam),
+    by = "play_id"
+  )
+
+# summarize actual vs predicted by team
+team_tds <- model_data_with_team %>%
+  group_by(posteam) %>%
+  summarise(
+    actual_td_rate = mean(touchdown),
+    predicted_td_rate = mean(predicted_prob),
+    attempts = n()
+  ) %>%
+  filter(attempts >= 10)  # remove outliers with tiny sample sizes
+
+# visual for teams above dashed line outperforming expectations
+ggplot(team_tds, aes(x = predicted_td_rate, y = actual_td_rate, label = posteam)) +
+  geom_point(color = "firebrick", size = 3) +
+  geom_text(vjust = -0.8, size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Red Zone TDs: Predicted vs. Actual by Team",
+    x = "Predicted TD Rate",
+    y = "Actual TD Rate"
+  ) +
+  theme_minimal()
+
+# Tactical Diversity & Red Zone Efficiency with the use of spread formation
+redzone <- pbp_2021 %>%
+  filter(yardline_100 <= 20, play_type %in% c("run", "pass")) %>%
+  arrange(game_id, play_id) %>%  # Important for lag
+  group_by(game_id) %>%
+  mutate(
+    prev_success = lag(success),
+    pass = if_else(play_type == "pass", 1, 0),
+    under_center = if_else(shotgun == 0, 1, 0),
+    inside_10 = if_else(yardline_100 <= 10, 1, 0),
+    touchdown = if_else(touchdown == 1, 1, 0)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(prev_success))  # remove first play of each game or drive
+
+model_data2 <- left_join(redzone,sharpdata, by = c("posteam" = "Team"))
+
+model_data2 <- model_data2 %>%
+  select(touchdown, down, yardline_100, pass, under_center, prev_success, spread_usage_pct) %>%
+  na.omit()
+
+model_glm2 <- glm(touchdown ~ down + yardline_100 + pass + under_center + prev_success + spread_usage_pct,
+                 data = model_data2, family = "binomial")
+
+summary(model_glm2)
+
+# add the predicted probabilities
+model_data2$predicted_prob <- predict(model_glm2, type = "response")
+
+# merge data to compare teams
+model_data2_with_team <- model_data2 %>%
+  mutate(play_id = row_number()) %>%  # create ID
+  left_join(
+    redzone %>% mutate(play_id = row_number()) %>% select(play_id, posteam),
+    by = "play_id"
+  )
+
+# summarize actual vs predicted by team
+team_tds <- model_data2_with_team %>%
+  group_by(posteam) %>%
+  summarise(
+    actual_td_rate = mean(touchdown),
+    predicted_td_rate = mean(predicted_prob),
+    attempts = n()
+  ) %>%
+  filter(attempts >= 10)  # remove outliers with tiny sample sizes
+
+# visual for teams above dashed line outperforming expectations
+ggplot(team_tds, aes(x = predicted_td_rate, y = actual_td_rate, label = posteam)) +
+  geom_point(color = "firebrick", size = 3) +
+  geom_text(vjust = -0.8, size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Red Zone TDs: Predicted vs. Actual by Team",
+    x = "Predicted TD Rate",
+    y = "Actual TD Rate"
+  ) +
+  theme_minimal()
+
+# Tactical Diversity & Inside the 10 yard line Efficiency
+redzone <- pbp_2021 %>%
+  filter(yardline_100 <= 10, play_type %in% c("run", "pass")) %>%
+  arrange(game_id, play_id) %>%  # Important for lag
+  group_by(game_id) %>%
+  mutate(
+    prev_success = lag(success),
+    pass = if_else(play_type == "pass", 1, 0),
+    under_center = if_else(shotgun == 0, 1, 0),
+    touchdown = if_else(touchdown == 1, 1, 0)
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(prev_success))  # remove first play of each game or drive
+
+model_data3 <- left_join(redzone,sharpdata, by = c("posteam" = "Team"))
+
+model_data3 <- model_data3 %>%
+  select(touchdown, down, yardline_100, pass, under_center, prev_success, spread_usage_pct) %>%
+  na.omit()
+
+model_glm3 <- glm(touchdown ~ down + yardline_100 + pass + under_center + prev_success + spread_usage_pct,
+                  data = model_data3, family = "binomial")
+
+summary(model_glm3)
+
+# add the predicted probabilities
+model_data3$predicted_prob <- predict(model_glm3, type = "response")
+
+# merge data to compare teams
+model_data3_with_team <- model_data3 %>%
+  mutate(play_id = row_number()) %>%  # create ID
+  left_join(
+    redzone %>% mutate(play_id = row_number()) %>% select(play_id, posteam),
+    by = "play_id"
+  )
+
+# summarize actual vs predicted by team
+team_tds <- model_data3_with_team %>%
+  group_by(posteam) %>%
+  summarise(
+    actual_td_rate = mean(touchdown),
+    predicted_td_rate = mean(predicted_prob),
+    attempts = n()
+  ) %>%
+  filter(attempts >= 5)  # remove outliers with tiny sample sizes
+
+# visual for teams above dashed line outperforming expectations
+ggplot(team_tds, aes(x = predicted_td_rate, y = actual_td_rate, label = posteam)) +
+  geom_point(color = "firebrick", size = 3) +
+  geom_text(vjust = -0.8, size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray40") +
+  labs(
+    title = "Red Zone TDs: Predicted vs. Actual by Team",
+    x = "Predicted TD Rate",
+    y = "Actual TD Rate"
+  ) +
+  theme_minimal()
