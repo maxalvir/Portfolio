@@ -1,0 +1,393 @@
+library(tidyverse)
+library(janitor)
+library(xgboost)
+library(dplyr)
+library(ggplot2)
+library(keras)
+library(reticulate)
+# Install Keras with a compatible Python version (forces 3.10 by default)
+install_keras(method = "conda", python_version = "3.10")
+
+
+
+# ---------------------------
+# 1. Load All CSV Files
+# ---------------------------
+
+# Update these file paths as needed
+scoring <- read_csv("lineup_scoring.csv") %>% clean_names()
+turnovers <- read_csv("lineup_turnovers.csv") %>% clean_names()
+misc <- read_csv("lineup_misc.csv") %>% clean_names()
+shooting <- read_csv("lineup_shooting.csv") %>% clean_names()
+assists <- read_csv("lineups_assists.csv") %>% clean_names()
+freethrows <- read_csv("lineups_freethrows.csv") %>% clean_names()
+rebounds <- read_csv("lineup_reb.csv") %>% clean_names()
+
+# ---------------------------
+# 2. Join Datasets by Team + Lineup
+# ---------------------------
+
+lineups <- scoring %>%
+  left_join(turnovers, by = c("team_abbreviation", "short_name", "games_played", "minutes")) %>%
+  left_join(misc, by = c("team_abbreviation", "short_name", "games_played", "minutes")) %>%
+  left_join(shooting, by = c("team_abbreviation", "short_name", "games_played", "minutes")) %>%
+  left_join(assists, by = c("team_abbreviation", "short_name", "games_played", "minutes")) %>%
+  left_join(freethrows, by = c("team_abbreviation", "short_name", "games_played", "minutes")) %>%
+  left_join(rebounds, by = c("team_abbreviation", "short_name", "games_played", "minutes"))
+
+# ---------------------------
+# 3. Filter for Lineups with 50+ Minutes
+# ---------------------------
+
+lineups <- lineups %>%
+  filter(minutes >= 45)
+
+# ---------------------------
+# 4. Feature Engineering
+# ---------------------------
+
+lineups <- lineups %>%
+  mutate(
+    # Core Efficiency
+    ortg = 100 * (points / off_poss),
+    turnover_rate = turnovers / off_poss,
+    assist_rate = assists / fg2m,
+    threepa_rate = fg3a / fg2a,
+    spacing_score = (threepa_rate + fg3pct) / 2,
+    ft_rate = fta / fg2a,
+    oreb_rate = off_rebounds / off_poss,
+    rim_shot_rate = at_rim_frequency
+)
+
+# ---------------------------
+# 5. Select Columns for Modeling
+# ---------------------------
+
+lineups_cleaned <- lineups %>%
+  select(
+    team_abbreviation, short_name,
+    minutes, off_poss, points, ortg,
+    fg2m, fg2a,
+    fg3m, fg3a, fg3pct, threepa_rate, spacing_score,
+    assists, assist_rate, turnovers, turnover_rate,
+    off_rebounds, oreb_rate,
+    fta, ft_rate,rim_shot_rate
+  )
+
+# ---------------------------
+# 6. Create features
+# ---------------------------
+
+features <- lineups_cleaned %>%
+  select(
+    spacing_score, assist_rate, turnover_rate, ft_rate, oreb_rate,
+    rim_shot_rate, minutes, threepa_rate, fg2m, fg3pct
+  ) %>%
+  mutate(
+    # Interaction terms
+    spacing_assist = spacing_score * assist_rate,
+    three_spacing = fg3pct * spacing_score,
+    efficiency_ratio = assist_rate / turnover_rate,
+    
+    # Polynomial features
+    # Basketball reasoning: Returns to spacing might be non-linear
+    # Going from poor spacing (1) to decent spacing (3) might have small impact
+    # Going from decent spacing (3) to elite spacing (5) might have huge impact
+    # The squared term captures this acceleration
+    spacing_score_sq = spacing_score^2,
+    assist_rate_sq = assist_rate^2,
+    
+    # Binned features Basketball reasoning: Lineup performance might have different patterns for
+    #High-minute lineups: Proven combinations, starters, reliable
+    # Low-minute lineups: Experimental, bench players, situational
+    minutes_high = ifelse(minutes > median(minutes), 1, 0),
+
+  )
+
+# ---------------------------
+# 7. XGBoosting Model
+# ---------------------------
+
+# Create design matrix
+X <- as.matrix(features)
+y <- lineups_cleaned$ortg
+
+# Sets the random seed to 42 for reproducible results.
+set.seed(42)
+n <- nrow(lineups_cleaned)
+train_idx <- sample(1:n, 0.7 * n)
+X_train <- X[train_idx, ]
+y_train <- y[train_idx]
+X_test <- X[-train_idx, ]
+y_test <- y[-train_idx]
+
+# Tune the model
+fit_example <- xgb.cv(data = X_train, label = y_train,
+                      params = list(booster = "gbtree",
+                                    objective = "reg:squarederror",
+                                    max.depth = 15,
+                                    eta = 0.1,
+                                    subsample = 0.1,
+                                    colsample_bytree = 0.5),
+                      eval_metric = "rmse",
+                      nfold = 5,
+                      watchlist = list(train = X_train, test = X_test),
+                      early_stopping_rounds = TRUE,
+                      nrounds = 1000)
+
+# `best_iteration` indicates the best iteration of the model fit, represented as the `nrounds` argument in our function.
+
+best_it <- fit_example$best_iteration
+fit_example$evaluation_log[best_it, ]
+
+eta <- seq(0.1, 0.9, 0.1)
+max_depth <- c(5, 10, 15)
+subsample <- c(0.5, 0.75, 1)
+colsample_bytree <- c(0.5, 0.75, 1)
+nrounds <- seq(100, 500, 100)
+
+grid_params <- expand.grid(nrounds = nrounds,
+                           max_depth = max_depth, 
+                           subsample = subsample,
+                           colsample_bytree = colsample_bytree,
+                           eta = eta)
+
+head(grid_params)
+
+n <- nrow(grid_params)
+n
+
+output_df <- data.frame("iter" = rep(NA, n), 
+                        "train_rmse_mean" = rep(NA, n), 
+                        "train_rmse_std" = rep(NA, n), 
+                        "test_rmse_mean" = rep(NA, n), 
+                        "test_rmse_std" = rep(NA, n))
+
+# Create xgb.DMatrix objects
+xgb_train <- xgb.DMatrix(data = X_train, label = y_train)
+xgb_test <- xgb.DMatrix(data = X_test, label = y_test)
+
+# Initialize output dataframe
+output_df <- data.frame(
+  iter = numeric(n),
+  train_rmse_mean = numeric(n),
+  train_rmse_std = numeric(n),
+  test_rmse_mean = numeric(n),
+  test_rmse_std = numeric(n)
+)
+
+for(i in 1:n){
+  
+  fit <- xgb.cv(data = xgb_train,
+                params = list(booster = "gbtree",
+                              objective = "reg:squarederror",
+                              max_depth = grid_params$max_depth[i],
+                              eta = grid_params$eta[i],
+                              subsample = grid_params$subsample[i],
+                              colsample_bytree = grid_params$colsample_bytree[i]),
+                eval_metric = "rmse",
+                nfold = 5,
+                nrounds = grid_params$nrounds[i],
+                early_stopping_rounds = 50,  # Use a number, not TRUE
+                verbose = FALSE)
+  
+  best_fit <- fit$best_iteration
+  
+  # Extract results more safely
+  eval_log <- fit$evaluation_log
+  best_row <- eval_log[eval_log$iter == best_fit, ]
+  
+  output_df[i, 1] <- best_fit
+  output_df[i, 2] <- best_row$train_rmse_mean
+  output_df[i, 3] <- best_row$train_rmse_std
+  output_df[i, 4] <- best_row$test_rmse_mean
+  output_df[i, 5] <- best_row$test_rmse_std
+
+}  
+
+best_params <- grid_params %>%
+  bind_cols(output_df) %>%
+  filter(test_rmse_mean == min(test_rmse_mean))
+  
+best_params
+
+# Train XGBoost model
+xgb_model <- xgboost(data = xgb_train,
+                   params = list(booster = "gbtree",
+                                 objective = "reg:squarederror",
+                                 max.depth = best_params$max_depth,
+                                 eta = best_params$eta,
+                                 subsample = best_params$subsample,
+                                 colsample_bytree = best_params$colsample_bytree),
+                   eval_metric = "rmse",
+                   nrounds = best_params$nrounds)
+
+
+xgb_model
+
+# Feature importance
+importance_matrix <- xgb.importance(colnames(xgb_train), model = xgb_model)
+
+importance_matrix %>%
+  as.data.frame() %>%
+  arrange(desc(Gain)) %>%
+  ggplot(aes(x = Gain, y = reorder(Feature, Gain))) +
+  geom_col()
+
+# Predictions
+train_pred_y <- predict(xgb_model, xgb_train)
+test_pred_y <- predict(xgb_model, xgb_test) 
+
+X_test %>%
+  bind_cols(ortg = y_test) %>%
+  mutate(pred_ortg = test_pred_y) %>%
+  ggplot(aes(x = pred_ortg, y = ortg)) +
+  geom_point() +
+  geom_abline()
+
+sqrt(mean((y_test - test_pred_y)^2))
+
+# ---------------------------
+# 8. Autoencoder — Discover Lineup Synergy Profiles
+# ---------------------------
+
+
+# Normalize input features
+X_scaled <- scale(X)
+# Define encoder dimension, data into a 2D representation.
+encoding_dim <- 2
+# Input layer
+input_layer <- layer_input(shape = ncol(X_scaled))
+# Builds the encoder that compresses input data through two dense layers: first to 8 units with ReLU activation, 
+# then to 2 units (the bottleneck) with linear activation.
+encoded <- input_layer %>%
+  layer_dense(units = 8, activation = "relu") %>%
+  layer_dense(units = encoding_dim, activation = "linear")
+# Builds the decoder that reconstructs the original data from the compressed representation, 
+# expanding from 2 units back to 8, then to the original input size.
+decoded <- encoded %>%
+  layer_dense(units = 8, activation = "relu") %>%
+  layer_dense(units = ncol(X_scaled), activation = "linear")
+# Autoencoder model
+autoencoder <- keras_model(inputs = input_layer, outputs = decoded)
+autoencoder %>% compile(
+  loss = "mean_squared_error",
+  optimizer = "adam"
+)
+# Train
+autoencoder %>% fit(
+  x = X_scaled,
+  y = X_scaled,
+  epochs = 50,
+  batch_size = 16,
+  validation_split = 0.2,
+  verbose = 1
+)
+# Encoder model only
+encoder <- keras_model(inputs = input_layer, outputs = encoded)
+# Get compressed 2D representation
+lineup_encoded <- encoder %>% predict(X_scaled)
+encoded_df <- as.data.frame(lineup_encoded)
+colnames(encoded_df) <- c("dim1", "dim2")
+encoded_df$lineup <- lineups_cleaned$short_name
+encoded_df$ortg <- lineups_cleaned$ortg
+
+ggplot(encoded_df, aes(x = dim1, y = dim2, color = ortg)) +
+  geom_point(alpha = 0.8) +
+  scale_color_viridis_c() +
+  theme_minimal() +
+  labs(
+    title = "Lineup Synergy Landscape",
+    x = "Latent Dimension 1",
+    y = "Latent Dimension 2",
+    color = "oRTG"
+  )
+
+# ---------------------------
+# 9. Compute Residuals from XGBoost
+# ---------------------------
+
+# Predict expected oRTG
+xgb_preds <- predict(xgb_model, newdata = X)
+
+# Residuals = actual - predicted
+residuals <- lineups_cleaned$ortg - xgb_preds
+
+# Add to your encoded_df
+encoded_df$residual <- residuals
+encoded_df$predicted_ortg <- xgb_preds
+
+# showcase under/over performing lineups
+encoded_df$performance <- case_when(
+  encoded_df$residual > 5 ~ "Overperforming",
+  encoded_df$residual < -5 ~ "Underperforming",
+  TRUE ~ "Expected"
+)
+
+# Enhanced Plot – Synergy Map + Over/Under Labels
+ggplot(encoded_df, aes(x = dim1, y = dim2)) +
+  geom_point(aes(color = performance), alpha = 0.9, size = 3) +
+  scale_color_manual(values = c(
+    "Overperforming" = "green3",
+    "Expected" = "gray70",
+    "Underperforming" = "red3"
+  )) +
+  theme_minimal() +
+  labs(
+    title = "Lineup Synergy Landscape (Autoencoder + XGBoost)",
+    subtitle = "Overperformers defy expectations based on statistical profile",
+    x = "Latent Dimension 1",
+    y = "Latent Dimension 2",
+    color = "Performance"
+  )
+
+# ---------------------------
+# 10. Label the top-5 overperformers
+# ---------------------------
+
+library(ggrepel)
+
+top5 <- encoded_df %>% arrange(desc(residual)) %>% head(5)
+
+ggplot(encoded_df, aes(x = dim1, y = dim2)) +
+  geom_point(aes(color = performance), alpha = 0.9, size = 3) +
+  geom_text_repel(data = top5, aes(label = lineup), size = 3) +
+  scale_color_manual(values = c("Overperforming" = "green3", "Expected" = "gray70", "Underperforming" = "red3")) +
+  theme_minimal() +
+  labs(title = "Top Overperforming Lineups (Autoencoder + XGBoost)")
+
+# add team to df
+encoded_df$team <- lineups_cleaned$team_abbreviation
+
+# Summarize how well teams are deploying high-synergy lineups:
+team_summary <- encoded_df %>%
+  group_by(team, performance) %>%
+  summarise(n_lineups = n()) %>%
+  pivot_wider(names_from = performance, values_from = n_lineups, values_fill = 0) %>%
+  mutate(total = rowSums(across(where(is.numeric))),
+         overperform_rate = Overperforming / total)
+
+# which team is maximizing lineups
+ggplot(team_summary, aes(x = reorder(team, overperform_rate), y = overperform_rate)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(
+    title = "Which Teams Deploy High-Synergy Lineups Most Effectively?",
+    x = "Team",
+    y = "Proportion of Overperforming Lineups"
+  ) +
+  theme_minimal()
+
+# ---------------------------
+# 11. The traits that makes these lineups work
+# ---------------------------
+
+# Filters the over performing lineups to see what they are doing well
+top_lineups <- encoded_df %>%
+  filter(performance == "Overperforming")
+
+# The summary traits show what makes these lineups work (spacing, moving the ball, etc)
+summary_traits <- lineups_cleaned %>%
+  filter(short_name %in% top_lineups$lineup) %>%
+  select(spacing_score, assist_rate, turnover_rate, ft_rate, oreb_rate, rim_shot_rate) %>%
+  summarise(across(everything(), list(mean = mean, sd = sd)))
