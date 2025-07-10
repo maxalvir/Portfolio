@@ -25,6 +25,16 @@ logistic regression models to predict red zone touchdown probability
 
 ---
 
+## 🏀 Overperformers and Outliers: A Machine Learning Study of NBA Lineup Success
+ - Built an autoencoder neural network to compress lineup statistics into 2D synergy profiles, revealing stylistic similarities and chemistry patterns across 2024–25 NBA lineups
+ - Used XGBoost to predict offensive rating and calculated performance residuals to flag lineups outperforming or underperforming their statistical profile
+ - Visualized synergy-performance interactions to identify which lineups teams should prioritize based on spacing, ball movement, rim pressure, and turnover control
+
+[View Code](OptimalLineups)
+ — [NBA Lineup Success.pdf](https://github.com/user-attachments/files/20617516/Fantasy.Football.Projections.Thesis.pdf)
+
+---
+
 ## 🏈 Fantasy Football Performance Modeling
 - Built weekly player projection models using R and Python (SARIMAX, Random Forest, Bayesian Inference).
 - Modeled game script and opponent strength for robust predictive outputs.
