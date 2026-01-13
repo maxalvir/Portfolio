@@ -48,10 +48,10 @@ logistic regression models to predict red zone touchdown probability
 - Designed and implemented predictive models using player tracking data to identify receiver and cornerback
 movement patterns, route tendencies, and coverage reactions across multiple weeks of NFL game data.
 - Developed an ensemble learning framework (LightGBM + XGBoost) and sequence modeling architecture
-(LSTM/GRU) in R to forecast post-release trajectories and route outcomes.
+ in R to forecast post-release trajectories and route outcomes.
 - Presented findings through animated data visualizations and play simulations
 
-- [2026 Big Data Bowl -Prediction Analysis](https://github.com/maxalvir/Portfolio/blob/f4992f987d0ea14a3f74924382571f028726115f/2026%20Big%20Data%20Bowl%20-%20Prediction.pdf) | [View Code](bdb26Prediction.Rmd)
+- [2026 Big Data Bowl - Prediction Analysis](https://github.com/maxalvir/Portfolio/blob/f4992f987d0ea14a3f74924382571f028726115f/2026%20Big%20Data%20Bowl%20-%20Prediction.pdf) | [View Code](bdb26Prediction.Rmd)
 ---
   
 📄 [(Maximus Alvir Resume.pdf)](https://github.com/maxalvir/Portfolio/blob/c924ee87051decbe92220bcc8a75b1235527efe5/Maximus%20Alvir%20Resume.pdf)
