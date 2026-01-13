@@ -45,7 +45,8 @@ logistic regression models to predict red zone touchdown probability
 
 ---
   
-📄 [(Maximus Alvir Resume.pdf)](https://github.com/maxalvir/Portfolio/blob/7691d8b2f04ffecd4462c5c9ef9e1087d45259a5/Maximus%20Alvir%202%20Resume.pdf)
+📄 [(Maximus Alvir Resume.pdf)]
+(https://github.com/maxalvir/Portfolio/blob/c924ee87051decbe92220bcc8a75b1235527efe5/Maximus%20Alvir%20Resume.pdf)
 
 📬 Contact: maxalvir@aol.com | [LinkedIn](https://www.linkedin.com/in/maximusalvir)
 
