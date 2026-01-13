@@ -1,0 +1,2254 @@
+---
+title: "bdb26prediction"
+output: html_document
+date: "2026-01-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+############################################################
+# Big Data Bowl 2026 - Complete Ensemble Model (XGBoost + LightGBM)
+# Target: predict both targeted WR and CB X,Y after release
+############################################################
+# -----------------------------
+# 0) Packages and configuration
+# -----------------------------
+library(tidyverse)
+library(data.table)
+library(xgboost)
+library(lightgbm)
+library(ggplot2)
+library(gganimate)
+library(dplyr)
+library(purrr)
+library(grid)
+library(nflfastR)
+library(nflreadr)
+
+# Global Configuration
+CFG <- list(
+  data_dir            = "C:/Users/maxal/OneDrive/Documents/data",
+  train_weeks         = 1,
+  cv_games_val_frac   = 0.10,
+  cv_games_test_frac  = 0.10,
+  prethrow_frames     = 10,
+  k_defenders         = 3,
+  pad_quantile        = 0.90,
+  seed                = 42,
+  use_external        = TRUE,
+  print_head          = TRUE
+)
+set.seed(CFG$seed)
+
+# -----------------------------
+# 1) Input / Output
+# -----------------------------
+load_week <- function(week) {
+  in_path  <- file.path(CFG$data_dir, sprintf("input_2023_w%02d.csv", week))
+  out_path <- file.path(CFG$data_dir, sprintf("output_2023_w%02d.csv", week))
+  input  <- as.data.table(readr::read_csv(in_path, progress = FALSE))
+  output <- as.data.table(readr::read_csv(out_path, progress = FALSE))
+  list(input = input, output = output)
+}
+
+load_train <- function(weeks = CFG$train_weeks) {
+  xs <- lapply(weeks, load_week)
+  input  <- rbindlist(lapply(xs, `[[`, "input"))
+  output <- rbindlist(lapply(xs, `[[`, "output"))
+  list(input = input, output = output)
+}
+
+# -----------------------------
+# 2) Geometry helpers
+# -----------------------------
+# Standardize all plays to face right
+normalize_direction <- function(dt) {
+  dt[, x_std := ifelse(play_direction == "left", 120 - x, x)]
+  dt[, y_std := y]
+  dt
+}
+
+# Rotates a point around a reference point (r = reference)
+rotate_xy <- function(x, y, rx, ry, theta) {
+  # Translate point to origin
+  xr <- x - rx; yr <- y - ry
+  # Applies rotation
+  list(
+    x =  xr*cos(theta) - yr*sin(theta),
+    y =  xr*sin(theta) + yr*cos(theta)
+  )
+}
+
+# Calculates distance from point to line segment (p = point, a = segment start, b = segment end)
+point_to_segment_dist <- function(px, py, ax, ay, bx, by) {
+  vx <- bx - ax; vy <- by - ay
+  wx <- px - ax; wy <- py - ay
+  c1 <- vx*wx + vy*wy
+  # closest to start of segment
+  if (c1 <= 0) return(sqrt((px-ax)^2 + (py-ay)^2))
+  c2 <- vx*vx + vy*vy
+  # closest to end of segment
+  if (c2 <= c1) return(sqrt((px-bx)^2 + (py-by)^2))
+  b  <- c1 / c2
+  qx <- ax + b*vx; qy <- ay + b*vy
+  sqrt((px-qx)^2 + (py-qy)^2)
+}
+
+# -----------------------------
+# 3) Feature builders
+# -----------------------------
+get_release_frame <- function(input_dt) {
+  input_dt[, release_frame := max(frame_id), by = .(game_id, play_id)]
+  input_dt[, frame_since_release := frame_id - release_frame]
+  input_dt
+}
+
+# ==========================================================
+# WIDE RECEIVER PREDICTION CODE
+# ==========================================================
+
+select_roles <- function(dt) {
+  list(
+    wr  = dt[player_role == "Targeted Receiver"],
+    def = dt[player_role == "Defensive Coverage"]
+  )
+}
+
+build_window_examples <- function(input_dt) {
+  input_dt <- normalize_direction(get_release_frame(input_dt))
+  N <- CFG$prethrow_frames
+  pre_snap_all <- input_dt[,
+                           .SD[frame_id == min(frame_id)],
+                           by = .(game_id, play_id)]
+  
+  # Only use offense players (team == offense) if that column exists
+  if ("team" %in% names(pre_snap_all)) {
+    offense_snap <- pre_snap_all[team == "offense" | player_role %in% c("Passer", "Targeted Receiver", "Other Route Runner")]
+  } else {
+    # exclude defensive roles
+    offense_snap <- pre_snap_all[!player_role %in% c("Defensive Coverage")]
+  }
+  
+  form_width <- offense_snap[, .(
+    formation_width = max(x_std, na.rm = TRUE) - min(x_std, na.rm = TRUE)
+  ), by = .(game_id, play_id)]
+  roles <- select_roles(input_dt)
+  if (nrow(roles$wr) == 0L || nrow(roles$def) == 0L) return(data.table())
+  
+  # WR at release
+  wr_rel <- roles$wr[frame_id == release_frame,
+                     .(game_id, play_id, nfl_id,
+                       wr_rel_x = x_std, wr_rel_y = y_std,
+                       wr_rel_s = s, wr_rel_a = a,
+                       wr_rel_dir = dir, wr_rel_o = o,
+                       absolute_yardline_number,
+                       ball_land_x, ball_land_y,
+                       num_frames_output,                      
+                       player_height, player_weight, player_birth_date)]
+  
+  # WR pre-snap alignment (earliest frame for each WR)
+  wr_pre <- roles$wr[
+    ,
+    .SD[which.min(frame_id)],
+    by = .(game_id, play_id, nfl_id)
+  ][, .(
+    game_id, play_id, nfl_id,
+    wr_pre_x = x_std,
+    wr_pre_y = y_std
+  )]
+  
+  wr_rel <- merge(
+    wr_rel,
+    wr_pre,
+    by = c("game_id", "play_id", "nfl_id"),
+    all.x = TRUE
+  )
+  
+  wr_rel[, player_age := as.numeric(substr(player_birth_date,1,4))]
+  wr_rel[, wt_lb  := as.numeric(player_weight)]
+  
+  conv_ht <- function(h) {
+    if (is.na(h)) return(NA_real_)
+    sp <- strsplit(as.character(h), "-")[[1]]
+    if (length(sp) == 2) return(as.numeric(sp[1])*12 + as.numeric(sp[2]))
+    as.numeric(h)
+  }
+  wr_rel[, ht_in := vapply(player_height, function(x) {
+    x <- as.character(x); if (grepl("-", x)) conv_ht(x) else suppressWarnings(as.numeric(x))
+  }, numeric(1))]
+  
+  wr_rel[, `:=`(
+    ht_in_z = (ht_in - mean(ht_in, na.rm=TRUE))/sd(ht_in, na.rm=TRUE),
+    wt_lb_z = (wt_lb - mean(wt_lb, na.rm=TRUE))/sd(wt_lb, na.rm=TRUE)
+  )]
+  
+  # Defenders at release
+  def_rel <- roles$def[,
+                       .SD[frame_id[.N]],
+                       by = .(game_id, play_id)
+  ][, .(game_id, play_id, def_id = nfl_id, x_std, y_std, s, a, dir)]
+  
+  # Attach K nearest by distance to WR at release -> ball_land line
+  K <- CFG$k_defenders
+  if (nrow(def_rel)) {
+    wr_k <- wr_rel[, .(game_id, play_id, wr_rel_x, wr_rel_y, ball_land_x, ball_land_y)]
+    def_rel <- merge(def_rel, wr_k, by = c("game_id","play_id"), all.x = TRUE)
+    
+    def_rel[, dist_line := mapply(
+      point_to_segment_dist,
+      px = x_std, py = y_std,
+      ax = wr_rel_x, ay = wr_rel_y,
+      bx = ball_land_x, by = ball_land_y
+    ), by = .(game_id, play_id)]
+    
+    def_rel <- def_rel[order(game_id, play_id, dist_line)]
+    def_rel[, k_rank := seq_len(.N), by = .(game_id, play_id)]
+    def_rel <- def_rel[k_rank <= K]
+  }
+  
+  # Rotate to WR-centric frame
+  to_rad <- function(d) d * pi / 180
+  wr_rel[, theta := -to_rad(wr_rel_dir)]
+  
+  if (nrow(def_rel)) {
+    def_rel <- merge(def_rel, wr_rel[, .(game_id, play_id, wr_rel_x, wr_rel_y, theta)],
+                     by = c("game_id","play_id"), all.x = TRUE)
+    rot <- rotate_xy(def_rel$x_std, def_rel$y_std, def_rel$wr_rel_x, def_rel$wr_rel_y, def_rel$theta)
+    def_rel[, `:=`(def_rx = rot$x, def_ry = rot$y)]
+  }
+  
+  # WR short history with micro features (last 3 frames)
+  wr_hist <- roles$wr[
+    frame_id > release_frame - N & frame_id <= release_frame
+  ][order(frame_id),
+    {
+      n  <- .N
+      # indices for last 3 frames in the window
+      idx_recent3 <- max(1, n - 2):n
+      
+      # time span of those frames (0.1 sec per frame)
+      dt_recent3 <- 0.1 * (length(idx_recent3) - 1)
+      
+      wr_dir_start_recent <- dir[idx_recent3[1]]
+      wr_dir_end_recent   <- dir[idx_recent3[length(idx_recent3)]]
+      
+      list(
+        wr_speed_mean  = mean(s, na.rm = TRUE),
+        wr_accel_mean  = mean(a, na.rm = TRUE),
+        wr_dir_change  = diff(range(dir, na.rm = TRUE)),
+        wr_stem_dx     = last(x_std) - first(x_std),
+        wr_stem_dy     = last(y_std) - first(y_std),
+        
+        # recent 3-frame micro stats
+        wr_speed_recent3     = mean(s[idx_recent3], na.rm = TRUE),
+        wr_accel_recent3     = mean(a[idx_recent3], na.rm = TRUE),
+        wr_dir_change_recent3 = diff(range(dir[idx_recent3], na.rm = TRUE)),
+        
+        # simple angular velocity over recent frames (deg per second)
+        wr_ang_vel_recent3 = ifelse(
+          dt_recent3 > 0,
+          (wr_dir_end_recent - wr_dir_start_recent) / dt_recent3,
+          0
+        )
+      )
+    },
+    by = .(game_id, play_id, nfl_id)
+  ]
+  
+  feats <- merge(wr_rel, wr_hist, by = c("game_id","play_id","nfl_id"), all.x = TRUE)
+  
+  # Defender Features (wide)
+  if (nrow(def_rel)) {
+    keep <- def_rel[, .(game_id, play_id, k_rank, def_rx, def_ry, s, a, dir)]
+    kdef_wide <- dcast(keep, game_id + play_id ~ k_rank,
+                       value.var = c("def_rx","def_ry","s","a","dir"),
+                       fun.aggregate = mean)
+    feats <- merge(feats, kdef_wide, by = c("game_id","play_id"), all.x = TRUE)
+  }
+  
+  # Ensure defender columns exist
+  needed_cols <- c(
+    "def_rx_1","def_ry_1","def_rx_2","def_ry_2","def_rx_3","def_ry_3",
+    "s_1","a_1","dir_1","s_2","a_2","dir_2","s_3","a_3","dir_3"
+  )
+  
+  for (nm in needed_cols) {
+    if (!nm %in% names(feats)) {
+      feats[, (nm) := NA_real_]
+    }
+  }
+  
+  # Feature Tuning
+  feats[, wr_to_ball_dist := sqrt((ball_land_x - wr_rel_x)^2 + (ball_land_y - wr_rel_y)^2)]
+  feats[, wr_heading := wr_rel_dir * pi / 180]
+  feats[, wr_to_ball_angle := atan2(ball_land_y - wr_rel_y, ball_land_x - wr_rel_x) - wr_heading]
+  feats[, wr_to_ball_angle := atan2(sin(wr_to_ball_angle), cos(wr_to_ball_angle))]
+  
+  feats[, db_min_dist_rotated := pmin(
+    sqrt(def_rx_1^2 + def_ry_1^2),
+    sqrt(def_rx_2^2 + def_ry_2^2),
+    sqrt(def_rx_3^2 + def_ry_3^2),
+    na.rm = TRUE
+  )]
+  
+  feats[, wr_to_land_dx := ball_land_x - wr_rel_x]
+  feats[, wr_to_land_dy := ball_land_y - wr_rel_y]
+  feats[, land_dist := sqrt((ball_land_x - wr_rel_x)^2 + (ball_land_y - wr_rel_y)^2)]
+  
+  # Defender closing speed
+  for (k in 1:3) {
+    vxk <- feats[[sprintf("s_%d", k)]] * cos(feats[[sprintf("dir_%d", k)]] * pi/180)
+    vyk <- feats[[sprintf("s_%d", k)]] * sin(feats[[sprintf("dir_%d", k)]] * pi/180)
+    dxk <- feats[[sprintf("def_rx_%d", k)]]
+    dyk <- feats[[sprintf("def_ry_%d", k)]]
+    rmag <- sqrt(dxk^2 + dyk^2)
+    feats[[sprintf("def_close_%d", k)]] <- (vxk*dxk + vyk*dyk) / pmax(rmag, 1e-6)
+  }
+  
+  # 1: Field context (WR-centric)
+  feats[, dist_sideline_left  := wr_rel_y]
+  feats[, dist_sideline_right := 53.3 - wr_rel_y]
+  feats[, dist_back_endzone   := 120 - wr_rel_x]
+  feats[, is_redzone          := as.integer(absolute_yardline_number >= 80)]
+  feats[, is_backed_up        := as.integer(absolute_yardline_number <= 20)]
+  
+  # 2 & 3: WR–CB separation + leverage (nearest DB in rotated frame)
+  feats[, wr_cb_dx := def_rx_1]
+  feats[, wr_cb_dy := def_ry_1]
+  feats[, wr_cb_dist := sqrt(pmax(def_rx_1^2 + def_ry_1^2, 0))]
+  
+  feats[, wr_cb_angle := atan2(def_ry_1, def_rx_1) - wr_heading]
+  feats[, wr_cb_angle := atan2(sin(wr_cb_angle), cos(wr_cb_angle))]
+  
+  # 4: WR pre-snap split and slot indicator
+  # fall back to release y if pre-snap is missing
+  feats[, wr_pre_y := ifelse(is.na(wr_pre_y), wr_rel_y, wr_pre_y)]
+  feats[, wr_split_left  := wr_pre_y]
+  feats[, wr_split_right := 53.3 - wr_pre_y]
+  
+  left_hash  <- 23.36
+  right_hash <- 29.94
+  feats[, wr_is_slot     := as.integer(wr_pre_y > left_hash & wr_pre_y < right_hash)]
+  feats[, wr_is_boundary := as.integer(wr_pre_y <= left_hash | wr_pre_y >= right_hash)]
+  
+  # 5: WR stem angle from pre-throw window
+  feats[, wr_stem_angle := atan2(wr_stem_dy, wr_stem_dx)]
+  feats[, wr_stem_angle := atan2(sin(wr_stem_angle), cos(wr_stem_angle))]
+  
+  # 6: merge formation width
+  feats <- merge(
+    feats,
+    form_width,
+    by = c("game_id", "play_id"),
+    all.x = TRUE
+  )
+
+  # 7: WR-CB Relative Velocity & Closing Speed
+  feats[, wr_vx := wr_rel_s * cos(wr_rel_dir * pi/180)]
+  feats[, wr_vy := wr_rel_s * sin(wr_rel_dir * pi/180)]
+  
+  feats[, cb_vx_1 := s_1 * cos(dir_1 * pi/180)]
+  feats[, cb_vy_1 := s_1 * sin(dir_1 * pi/180)]
+  
+  feats[, wr_cb_rel_vx := wr_vx - cb_vx_1]
+  feats[, wr_cb_rel_vy := wr_vy - cb_vy_1]
+  feats[, wr_cb_rel_speed := sqrt(wr_cb_rel_vx^2 + wr_cb_rel_vy^2)]
+  
+  # Closing speed: negative means approaching
+  feats[, wr_cb_closing_speed := -(wr_cb_rel_vx * def_rx_1 + wr_cb_rel_vy * def_ry_1) / 
+          pmax(wr_cb_dist, 0.01)]
+  
+  # 8: Time-to-Ball Features
+  feats[, time_to_ball := land_dist / pmax(wr_rel_s, 0.1)]
+  
+  # CB distance to ball in absolute coordinates
+  feats[, cb_abs_x_1 := wr_rel_x + def_rx_1 * cos(-theta) - def_ry_1 * sin(-theta)]
+  feats[, cb_abs_y_1 := wr_rel_y + def_rx_1 * sin(-theta) + def_ry_1 * cos(-theta)]
+  feats[, cb_to_ball_land_dist := sqrt((ball_land_x - cb_abs_x_1)^2 + 
+                                         (ball_land_y - cb_abs_y_1)^2)]
+  feats[, cb_time_to_ball := cb_to_ball_land_dist / pmax(s_1, 0.1)]
+  
+  # Time advantage: negative means CB arrives first (advantage for defense)
+  feats[, wr_cb_time_advantage := time_to_ball - cb_time_to_ball]
+  
+  # 9: Route Curvature (already have stem angle, add directional variance)
+  # This should ideally come from wr_hist, but we can approximate here
+  feats[, route_curvature := abs(wr_dir_change_recent3)]
+  
+  # 10: Down-Distance Context Interactions
+  if (all(c("down", "ydstogo") %in% names(feats))) {
+    feats[, pass_prob := fifelse(
+      down >= 3 & ydstogo > 7, 1.0,
+      fifelse(down == 1 & ydstogo <= 3, 0.0, 0.5)
+    )]
+    
+    feats[, expected_depth := fifelse(
+      down == 3 & ydstogo > 10, 15,
+      fifelse(down == 2, 7, 5)
+    )]
+    
+    feats[, depth_vs_expected := (ball_land_x - wr_rel_x) - expected_depth]
+    
+    # Third down pressure indicator
+    feats[, is_third_down := as.integer(down == 3)]
+    feats[, is_long_down := as.integer(ydstogo >= 10)]
+    feats[, third_and_long := as.integer(down == 3 & ydstogo >= 10)]
+  }
+  
+  # 11: WR Acceleration Components (along and perpendicular to route)
+  feats[, accel_along_route := wr_rel_a * cos((wr_rel_o - wr_rel_dir) * pi/180)]
+  feats[, accel_perp_route := wr_rel_a * sin((wr_rel_o - wr_rel_dir) * pi/180)]
+  
+  # 12: Cushion and Leverage Features
+  # Cushion: distance between WR and CB
+  feats[, cushion := wr_cb_dist]
+  
+  # Leverage: is CB between WR and ball? (positive if CB has inside leverage)
+  feats[, cb_leverage := sign(def_rx_1 * (ball_land_x - wr_rel_x) + 
+                                def_ry_1 * (ball_land_y - wr_rel_y))]
+  
+  # 13: Multiple Defender Pressure
+  feats[, def_density := sqrt(
+    1/pmax(sqrt(def_rx_1^2 + def_ry_1^2), 0.1) +
+      1/pmax(sqrt(def_rx_2^2 + def_ry_2^2), 0.1) +
+      1/pmax(sqrt(def_rx_3^2 + def_ry_3^2), 0.1)
+  )]
+  
+  feats[]
+}
+
+build_train_rows <- function(input_dt, output_dt, feats) {
+  # Keep only WRs that have features
+  wr_ids <- unique(feats[, .(game_id, play_id, nfl_id)])
+  out_wr <- merge(output_dt, wr_ids, by = c("game_id", "play_id", "nfl_id"))
+  
+  # Add play direction for standardization
+  dir_tbl <- unique(input_dt[, .(game_id, play_id, play_direction)])
+  out_wr <- merge(out_wr, dir_tbl, by = c("game_id", "play_id"), all.x = TRUE)
+  
+  # Targets in standardized coordinates
+  out_wr[, x_tgt := ifelse(play_direction == "left", 120 - x, x)]
+  out_wr[, y_tgt := y]
+  out_wr[, c("x", "y", "play_direction") := NULL]
+  
+  # Bring in num_frames_output from input (per game/play/player)
+  nf_tbl <- input_dt[, .(
+    num_frames_output = max(num_frames_output, na.rm = TRUE)
+  ), by = .(game_id, play_id, nfl_id)]
+  out_wr <- merge(out_wr, nf_tbl, by = c("game_id", "play_id", "nfl_id"), all.x = TRUE)
+  
+  # Time since release is just the output frame index (0-based)
+  out_wr[, frame_since_release := pmax(frame_id - 1, 0)]
+  
+  # Time Features
+  out_wr[, t_rel := frame_since_release]
+  out_wr[, t_norm := fifelse(
+    is.finite(num_frames_output) & num_frames_output > 0,
+    frame_since_release / num_frames_output,
+    0
+  )]
+  
+  # late-frame indicators
+  out_wr[, is_late_frame      := as.integer(t_norm >= 0.7)]
+  out_wr[, is_very_late_frame := as.integer(t_norm >= 0.9)]
+  
+  # Merge with WR feature table
+  trn <- merge(out_wr, feats, by = c("game_id", "play_id", "nfl_id"), all.x = TRUE)
+  trn[]
+}
+
+compute_priors <- function(input_dt) {
+  pri_wr <- input_dt[player_role == "Targeted Receiver",
+                     .(wr_speed_p80 = quantile(s, 0.80, na.rm = TRUE),
+                       wr_accel_p80 = quantile(a, 0.80, na.rm = TRUE)),
+                     by = nfl_id]
+  list(pri_wr = pri_wr)
+}
+
+attach_priors <- function(feats, pri) {
+  feats <- merge(feats, pri$pri_wr, by = "nfl_id", all.x = TRUE)
+  for (v in c("wr_speed_p80","wr_accel_p80")) {
+    feats[is.na(get(v)), (v) := mean(feats[[v]], na.rm = TRUE)]
+  }
+  feats[]
+}
+
+.build_feat_names <- function() {
+  c(
+    # field / situation
+    "absolute_yardline_number",
+    "yardline_100",
+    "down",
+    "ydstogo",
+    "qtr",
+    "score_diff",
+    
+    # field context
+    "dist_sideline_left",
+    "dist_sideline_right",
+    "dist_back_endzone",
+    "is_redzone",
+    "is_backed_up",
+    
+    # alignment and formation
+    "wr_split_left",
+    "wr_split_right",
+    "wr_is_slot",
+    "wr_is_boundary",
+    "wr_stem_angle",
+    "formation_width",
+    
+    # WR + priors + micro
+    "wr_rel_s","wr_rel_a",
+    "wr_dir_change","wr_speed_mean","wr_accel_mean",
+    "wr_speed_recent3","wr_accel_recent3",
+    "wr_dir_change_recent3","wr_ang_vel_recent3",
+    "wr_speed_p80","wr_accel_p80",
+    
+    # WR–CB separation
+    "wr_cb_dx","wr_cb_dy","wr_cb_dist","wr_cb_angle",
+    
+    # defender geometry
+    "def_rx_1","def_ry_1","def_rx_2","def_ry_2","def_rx_3","def_ry_3",
+    
+    # ball context
+    "ball_land_x","ball_land_y",
+    
+    # time
+    "t_rel","t_norm",
+    "is_late_frame","is_very_late_frame",
+    
+    # WR-to-ball geometry
+    "wr_to_land_dx","wr_to_land_dy","land_dist",
+    
+    # defender closing
+    "def_close_1","def_close_2","def_close_3",
+    
+    # body metrics
+    "ht_in_z","wt_lb_z",
+    
+    # Velocity & Closing
+    "wr_vx","wr_vy",
+    "cb_vx_1","cb_vy_1",
+    "wr_cb_rel_vx","wr_cb_rel_vy","wr_cb_rel_speed",
+    "wr_cb_closing_speed",
+    
+    # Time to Ball
+    "time_to_ball",
+    "cb_to_ball_land_dist","cb_time_to_ball",
+    "wr_cb_time_advantage",
+    
+    # Route
+    "route_curvature",
+    "accel_along_route","accel_perp_route",
+    
+    # Down/Distance Context
+    "pass_prob","expected_depth","depth_vs_expected",
+    "is_third_down","is_long_down","third_and_long",
+    
+    # Leverage & Pressure
+    "cushion","cb_leverage","def_density"
+  )
+}
+
+# ==========================================================
+# CORNERBACK PREDICTION CODE
+# ==========================================================
+
+select_roles_cb <- function(dt) {
+  list(
+    wr  = dt[player_role == "Targeted Receiver"],
+    cb  = dt[player_role == "Defensive Coverage"],
+    qb  = dt[player_role == "Passer"]
+  )
+}
+
+build_window_examples_cb <- function(input_dt){ 
+  input_dt <- normalize_direction(get_release_frame(input_dt)) 
+  N <- CFG$prethrow_frames 
+  roles <- select_roles_cb(input_dt) 
+  if (nrow(roles$wr) == 0L || nrow(roles$cb) == 0L || nrow(roles$qb) == 0L) return(data.table()) 
+  
+  # WR at release (for context) 
+  wr_rel <- roles$wr[frame_id == release_frame, 
+                     .(game_id, play_id, nfl_id_wr = nfl_id, 
+                       wr_rel_x = x_std, wr_rel_y = y_std, 
+                       wr_rel_s = s, wr_rel_a = a, 
+                       wr_rel_dir = dir, wr_rel_o = o, 
+                       absolute_yardline_number, num_frames_output, 
+                       ball_land_x, ball_land_y)] 
+  
+  # QB at release (for context) 
+  qb_rel <- roles$qb[frame_id == release_frame,
+                     .(game_id, play_id, nfl_id_qb = nfl_id, 
+                       qb_rel_x = x_std, qb_rel_y = y_std, 
+                       qb_rel_s = s, qb_rel_dir = dir)] 
+  
+  # CORNERBACKS at release 
+  cb_rel <- roles$cb[frame_id == release_frame,
+                     .(game_id, play_id, nfl_id, 
+                       cb_rel_x = x_std, cb_rel_y = y_std, 
+                       cb_rel_s = s, cb_rel_a = a, num_frames_output, 
+                       cb_rel_dir = dir, cb_rel_o = o)] 
+  
+  # CB short history with micro features (last 3 frames)
+  cb_hist <- roles$cb[
+    frame_id > release_frame - N & frame_id <= release_frame
+  ][order(frame_id),
+    {
+      n  <- .N
+      idx_recent3 <- max(1, n - 2):n
+      dt_recent3  <- 0.1 * (length(idx_recent3) - 1)
+      
+      cb_dir_start_recent <- dir[idx_recent3[1]]
+      cb_dir_end_recent   <- dir[idx_recent3[length(idx_recent3)]]
+      
+      list(
+        cb_speed_mean  = mean(s, na.rm = TRUE),
+        cb_accel_mean  = mean(a, na.rm = TRUE),
+        cb_dir_change  = diff(range(dir, na.rm = TRUE)),
+        
+        cb_speed_recent3      = mean(s[idx_recent3], na.rm = TRUE),
+        cb_accel_recent3      = mean(a[idx_recent3], na.rm = TRUE),
+        cb_dir_change_recent3 = diff(range(dir[idx_recent3], na.rm = TRUE)),
+        cb_ang_vel_recent3    = ifelse(
+          dt_recent3 > 0,
+          (cb_dir_end_recent - cb_dir_start_recent) / dt_recent3,
+          0
+        )
+      )
+    },
+    by = .(game_id, play_id, nfl_id)
+  ]
+  
+  feats <- merge(cb_rel, cb_hist, by = c("game_id","play_id","nfl_id"), all.x = TRUE)
+  feats <- merge(feats, wr_rel, by = c("game_id","play_id"), all.x = TRUE)
+  feats <- merge(feats, qb_rel, by = c("game_id","play_id"), all.x = TRUE)
+  
+  # Rotate to CB-centric frame 
+  to_rad <- function(d) d * pi / 180 
+  feats[, theta := -to_rad(cb_rel_dir)] 
+  
+  # Rotate WR position relative to CB 
+  rot_wr <- rotate_xy(feats$wr_rel_x, feats$wr_rel_y, 
+                      feats$cb_rel_x, feats$cb_rel_y, feats$theta) 
+  feats[, `:=`(wr_rx = rot_wr$x, wr_ry = rot_wr$y)]
+  
+  # Rotate QB position relative to CB 
+  rot_qb <- rotate_xy(feats$qb_rel_x, feats$qb_rel_y, 
+                      feats$cb_rel_x, feats$cb_rel_y, feats$theta) 
+  feats[, `:=`(qb_rx = rot_qb$x, qb_ry = rot_qb$y)] 
+  
+  # Rotate ball landing position relative to CB 
+  rot_ball <- rotate_xy(feats$ball_land_x, feats$ball_land_y, 
+                        feats$cb_rel_x, feats$cb_rel_y, feats$theta) 
+  feats[, `:=`(ball_rx = rot_ball$x, ball_ry = rot_ball$y)]
+  
+  # Geometric features 
+  feats[, cb_to_wr_dist := sqrt((wr_rel_x - cb_rel_x)^2 + (wr_rel_y - cb_rel_y)^2)] 
+  feats[, cb_to_ball_dist := sqrt((ball_land_x - cb_rel_x)^2 + (ball_land_y - cb_rel_y)^2)] 
+  feats[, cb_to_qb_dist := sqrt((qb_rel_x - cb_rel_x)^2 + (qb_rel_y - cb_rel_y)^2)] 
+  
+  feats[, cb_heading := cb_rel_dir * pi / 180] 
+  feats[, cb_to_wr_angle := atan2(wr_rel_y - cb_rel_y, wr_rel_x - cb_rel_x) - cb_heading] 
+  feats[, cb_to_wr_angle := atan2(sin(cb_to_wr_angle), cos(cb_to_wr_angle))] 
+  feats[, cb_to_ball_angle := atan2(ball_land_y - cb_rel_y, ball_land_x - cb_rel_x) - cb_heading] 
+  feats[, cb_to_ball_angle := atan2(sin(cb_to_ball_angle), cos(cb_to_ball_angle))] 
+  
+  feats[, dist_to_wr_ball_line := mapply(
+    point_to_segment_dist, px = cb_rel_x, py = cb_rel_y, 
+    ax = wr_rel_x, ay = wr_rel_y, bx = ball_land_x, by = ball_land_y )] 
+  
+  # Velocity features 
+  feats[, wr_vx := wr_rel_s * cos(wr_rel_dir * pi/180)] 
+  feats[, wr_vy := wr_rel_s * sin(wr_rel_dir * pi/180)] 
+  
+  feats[, cb_vx := cb_rel_s * cos(cb_rel_dir * pi/180)]
+  feats[, cb_vy := cb_rel_s * sin(cb_rel_dir * pi/180)]
+  feats[, cb_closing_to_wr := ((cb_vx * (wr_rel_x - cb_rel_x)) + 
+                                 (cb_vy * (wr_rel_y - cb_rel_y))) / 
+          pmax(cb_to_wr_dist, 1e-6)]
+  
+  # CB field and situation context
+  feats[, dist_sideline_left  := cb_rel_y]
+  feats[, dist_sideline_right := 53.3 - cb_rel_y]
+  feats[, dist_back_endzone   := 120 - cb_rel_x]
+  feats[, is_redzone          := as.integer(absolute_yardline_number >= 80)]
+  feats[, is_backed_up        := as.integer(absolute_yardline_number <= 20)]
+  
+  # 1) CB-WR Relative Velocity (already have closing_to_wr, but add more detail)
+  feats[, cb_wr_rel_speed := sqrt((cb_vx - wr_vx)^2 + (cb_vy - wr_vy)^2)]
+  
+  # 2) Time-to-Ball and Time-to-WR
+  feats[, cb_time_to_ball := cb_to_ball_dist / pmax(cb_rel_s, 0.1)]
+  feats[, wr_time_to_ball := sqrt((ball_land_x - wr_rel_x)^2 + 
+                                    (ball_land_y - wr_rel_y)^2) / pmax(wr_rel_s, 0.1)]
+  feats[, cb_time_to_wr := cb_to_wr_dist / pmax(cb_rel_s, 0.1)]
+  
+  # CB time advantage: negative means WR gets there first (bad for CB)
+  feats[, cb_wr_time_advantage := cb_time_to_ball - wr_time_to_ball]
+  
+  # 3) Route Reading Features
+  feats[, cb_facing_wr := cos(cb_to_wr_angle)]  # 1 = facing directly, -1 = back turned
+  feats[, cb_facing_ball := cos(cb_to_ball_angle)]
+  
+  # 4) Leverage and Position
+  # Is CB between WR and ball? (positive if yes)
+  feats[, cb_has_inside_leverage := as.integer(
+    dist_to_wr_ball_line < cb_to_wr_dist * 0.8
+  )]
+  
+  # 5) Down-Distance Context (if available)
+  if (all(c("down", "ydstogo") %in% names(feats))) {
+    feats[, pass_prob := fifelse(
+      down >= 3 & ydstogo > 7, 1.0,
+      fifelse(down == 1 & ydstogo <= 3, 0.0, 0.5)
+    )]
+    
+    feats[, expected_depth := fifelse(
+      down == 3 & ydstogo > 10, 15,
+      fifelse(down == 2, 7, 5)
+    )]
+    
+    feats[, is_third_down := as.integer(down == 3)]
+    feats[, is_long_down := as.integer(ydstogo >= 10)]
+    feats[, third_and_long := as.integer(down == 3 & ydstogo >= 10)]
+  }
+  
+  # 6) CB Acceleration Components
+  feats[, cb_accel_toward_wr := cb_rel_a * cos((cb_rel_o - cb_to_wr_angle - cb_heading) * pi/180)]
+  feats[, cb_accel_toward_ball := cb_rel_a * cos((cb_rel_o - cb_to_ball_angle - cb_heading) * pi/180)]
+  
+  # 7) QB Pressure Indicators
+  feats[, qb_to_cb_angle := atan2(cb_rel_y - qb_rel_y, cb_rel_x - qb_rel_x)]
+  feats[, qb_facing_cb := cos((qb_rel_dir * pi/180) - qb_to_cb_angle)]  # Is QB looking at CB?
+  
+  feats[]
+}
+
+build_train_rows_cb <- function(input_dt, output_dt, feats) {
+  cb_ids <- unique(feats[, .(game_id, play_id, nfl_id)])
+  out_cb <- merge(output_dt, cb_ids, by = c("game_id", "play_id", "nfl_id"))
+  
+  dir_tbl <- unique(input_dt[, .(game_id, play_id, play_direction)])
+  out_cb <- merge(out_cb, dir_tbl, by = c("game_id", "play_id"), all.x = TRUE)
+  
+  out_cb[, x_tgt := ifelse(play_direction == "left", 120 - x, x)]
+  out_cb[, y_tgt := y]
+  out_cb[, c("x", "y", "play_direction") := NULL]
+  
+  # Bring num_frames_output from input
+  nf_tbl <- input_dt[, .(
+    num_frames_output = max(num_frames_output, na.rm = TRUE)
+  ), by = .(game_id, play_id, nfl_id)]
+  out_cb <- merge(out_cb, nf_tbl, by = c("game_id", "play_id", "nfl_id"), all.x = TRUE)
+  
+  # Time since release: output frame index (0-based)
+  out_cb[, frame_since_release := pmax(frame_id - 1, 0)]
+  
+  # Time features
+  out_cb[, t_rel := frame_since_release]
+  out_cb[, t_norm := fifelse(
+    is.finite(num_frames_output) & num_frames_output > 0,
+    frame_since_release / num_frames_output,
+    0
+  )]
+  
+  # new: late-frame indicators
+  out_cb[, is_late_frame      := as.integer(t_norm >= 0.7)]
+  out_cb[, is_very_late_frame := as.integer(t_norm >= 0.9)]
+  
+  trn <- merge(out_cb, feats, by = c("game_id", "play_id", "nfl_id"), all.x = TRUE)
+  trn[]
+}
+
+compute_priors_cb <- function(input_dt) {
+  pri_cb <- input_dt[player_role == "Defensive Coverage",
+                     .(cb_speed_p80 = quantile(s, 0.80, na.rm = TRUE),
+                       cb_accel_p80 = quantile(a, 0.80, na.rm = TRUE)),
+                     by = nfl_id]
+  list(pri_cb = pri_cb)
+}
+
+attach_priors_cb <- function(feats, pri) {
+  feats <- merge(feats, pri$pri_cb, by = "nfl_id", all.x = TRUE)
+  for (v in c("cb_speed_p80","cb_accel_p80")) {
+    feats[is.na(get(v)), (v) := mean(feats[[v]], na.rm = TRUE)]
+  }
+  feats[]
+}
+
+.build_feat_names_cb <- function() {
+  c(
+    # field / situation
+    "absolute_yardline_number",
+    "yardline_100",
+    "down",
+    "ydstogo",
+    "qtr",
+    "score_diff",
+    
+    # CB field context
+    "dist_sideline_left",
+    "dist_sideline_right",
+    "dist_back_endzone",
+    "is_redzone",
+    "is_backed_up",
+    
+    # CB + priors + micro
+    "cb_rel_s","cb_rel_a",
+    "cb_dir_change","cb_speed_mean","cb_accel_mean",
+    "cb_speed_recent3","cb_accel_recent3",
+    "cb_dir_change_recent3","cb_ang_vel_recent3",
+    "cb_speed_p80","cb_accel_p80",
+    
+    # rotated positions
+    "wr_rx","wr_ry","qb_rx","qb_ry","ball_rx","ball_ry",
+    
+    # distances
+    "cb_to_wr_dist","cb_to_ball_dist","cb_to_qb_dist",
+    
+    # angles
+    "cb_to_wr_angle","cb_to_ball_angle",
+    "dist_to_wr_ball_line",
+    
+    # velocities
+    "wr_vx","wr_vy","cb_closing_to_wr",
+    
+    # time
+    "t_rel","t_norm",
+    "is_late_frame","is_very_late_frame",
+    
+    # Relative Speed & Time
+    "cb_wr_rel_speed",
+    "cb_time_to_ball","wr_time_to_ball","cb_time_to_wr",
+    "cb_wr_time_advantage",
+    
+    # Route Reading
+    "cb_facing_wr","cb_facing_ball",
+    
+    # Leverage
+    "cb_has_inside_leverage",
+    
+    # Down/Distance Context
+    "pass_prob","expected_depth",
+    "is_third_down","is_long_down","third_and_long",
+    
+    # Acceleration
+    "cb_accel_toward_wr","cb_accel_toward_ball",
+    
+    # QB Context
+    "qb_to_cb_angle","qb_facing_cb"
+  )
+}
+
+# -----------------------------
+# 5) Optional external hooks
+# -----------------------------
+add_external_context <- local({
+  pbp_ctx <- NULL
+  
+  function(feats) {
+    # Load and cache 2023 pbp on first call
+    if (is.null(pbp_ctx)) {
+      message("Loading nflfastR / nflreadr pbp for 2023...")
+      
+      pbp_raw <- nflreadr::load_pbp(2023)
+      
+      # Convert to data.table first, then use data.table syntax
+      pbp_ctx <<- as.data.table(pbp_raw)[
+        ,
+        .(
+          game_id_chr = as.character(old_game_id),  # matches tracking game_id
+          play_id,
+          down,
+          ydstogo,
+          yardline_100,
+          qtr,
+          score_diff = posteam_score - defteam_score
+        )
+      ]
+    }
+    
+    # Build same join key on your feature table
+    feats[, game_id_chr := as.character(game_id)]
+    
+    feats <- merge(
+      feats,
+      pbp_ctx,
+      by = c("game_id_chr", "play_id"),
+      all.x = TRUE
+    )
+    
+    feats[, game_id_chr := NULL]
+    feats
+  }
+})
+
+add_external_priors <- function(feats) {
+  feats
+}
+
+# ==========================================================
+# 6) Baseline + XGBoost + LightGBM Ensemble Models
+# ==========================================================
+
+.build_feature_matrix <- function(df, feat_names) {
+  use <- intersect(feat_names, names(df))
+  Xdf <- df[, ..use]
+  
+  for (nm in names(Xdf)) {
+    Xdf[[nm]] <- suppressWarnings(as.numeric(Xdf[[nm]]))
+  }
+  
+  X <- as.matrix(Xdf)
+  attr(X, "feat_names") <- use
+  X
+}
+
+# Grid builder for XGBoost
+.build_param_grid <- function() {
+  expand.grid(
+    nrounds = c(200, 400, 600),
+    max_depth = c(4, 6, 8),
+    subsample = c(0.7, 0.8, 0.9),
+    colsample_bytree = c(0.7, 0.8, 0.9),
+    eta = c(0.05, 0.1, 0.15),
+    min_child_weight = c(1, 3, 5),
+    gamma = c(0, 0.1, 0.3)
+  )
+}
+
+.tune_xgb_cv <- function(X_train, y_train, nfold = 3, early_stopping_rounds = 30, seed = 42, verbose = FALSE) {
+  set.seed(seed)
+  xgb_train <- xgb.DMatrix(data = X_train, label = y_train)
+  
+  grid_params <- .build_param_grid()
+  n <- nrow(grid_params)
+  
+  output_df <- data.frame(
+    iter = numeric(n),
+    train_rmse_mean = numeric(n),
+    train_rmse_std = numeric(n),
+    test_rmse_mean = numeric(n),
+    test_rmse_std = numeric(n)
+  )
+  
+  for (i in 1:n) {
+    prm <- list(
+      booster = "gbtree",
+      objective = "reg:squarederror",
+      max_depth = grid_params$max_depth[i],
+      eta = grid_params$eta[i],
+      subsample = grid_params$subsample[i],
+      colsample_bytree = grid_params$colsample_bytree[i],
+      min_child_weight = grid_params$min_child_weight[i],
+      gamma = grid_params$gamma[i]
+    )
+    
+    fit <- xgb.cv(
+      data = xgb_train,
+      params = prm,
+      eval_metric = "rmse",
+      nfold = nfold,
+      nrounds = grid_params$nrounds[i],
+      early_stopping_rounds = early_stopping_rounds,
+      verbose = verbose
+    )
+    
+    best_it <- fit$best_iteration
+    eval_log <- fit$evaluation_log
+    best_row <- eval_log[eval_log$iter == best_it, ]
+    
+    output_df$iter[i]             <- best_it
+    output_df$train_rmse_mean[i]  <- best_row$train_rmse_mean
+    output_df$train_rmse_std[i]   <- best_row$train_rmse_std
+    output_df$test_rmse_mean[i]   <- best_row$test_rmse_mean
+    output_df$test_rmse_std[i]    <- best_row$test_rmse_std
+  }
+  
+  best_params <- cbind(grid_params, output_df) %>%
+    dplyr::filter(test_rmse_mean == min(test_rmse_mean, na.rm = TRUE))
+  
+  list(
+    params = list(
+      booster = "gbtree",
+      objective = "reg:squarederror",
+      max_depth = best_params$max_depth[1],
+      eta = best_params$eta[1],
+      subsample = best_params$subsample[1],
+      colsample_bytree = best_params$colsample_bytree[1]
+    ),
+    nrounds = best_params$nrounds[1],
+    best_iteration = best_params$iter[1],
+    grid_summary = cbind(grid_params, output_df)
+  )
+}
+
+.train_xgb_for_target <- function(train_df, val_df, feat_names, target_name) {
+  X_train <- .build_feature_matrix(train_df, feat_names)
+  y_train <- train_df[[target_name]]
+  
+  wt_train <- NULL
+  if ("w" %in% names(train_df)) {
+    wt_train <- train_df$w
+    wt_train[!is.finite(wt_train)] <- 1.0
+    wt_train <- pmax(wt_train, 1e-6)
+  }
+  
+  X_val <- .build_feature_matrix(val_df, feat_names)
+  y_val <- val_df[[target_name]]
+  
+  wt_val <- NULL
+  if ("w" %in% names(val_df)) {
+    wt_val <- val_df$w
+    wt_val[!is.finite(wt_val)] <- 1.0
+    wt_val <- pmax(wt_val, 1e-6)
+  }
+  
+  # FAST: Use proven good hyperparameters (no grid search)
+  tuned <- list(
+    params = list(
+      booster = "gbtree",
+      objective = "reg:squarederror",
+      max_depth = 8,
+      eta = 0.1,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      min_child_weight = 3,
+      gamma = 0.1
+    ),
+    nrounds = 400,
+    best_iteration = 400
+  )
+  
+  if (!is.null(wt_train)) {
+    stopifnot(all(is.finite(wt_train)), all(wt_train > 0))
+  }
+  
+  dtrain <- xgb.DMatrix(data = X_train, label = y_train, weight = wt_train)
+  dval <- xgb.DMatrix(data = X_val, label = y_val, weight = wt_val)
+  
+  # Train with early stopping on validation set
+  model <- xgb.train(
+    data = dtrain,
+    params = tuned$params,
+    nrounds = 600,
+    watchlist = list(train = dtrain, val = dval),
+    early_stopping_rounds = 50,
+    verbose = 0
+  )
+  
+  importance_matrix <- xgb.importance(model = model)
+  
+  pred_val <- as.numeric(predict(model, dval))
+  rmse_val <- sqrt(mean((y_val - pred_val)^2, na.rm = TRUE))
+  
+  list(model = model, tuned = tuned, feat_names = feat_names,
+       val_rmse = rmse_val, importance = importance_matrix)
+}
+
+# ==========================================================
+# LightGBM Training Functions
+# ==========================================================
+
+.build_lgb_param_grid <- function() {
+  expand.grid(
+    num_iterations = c(200, 400, 600),
+    num_leaves = c(31, 63, 127),
+    max_depth = c(5, 8, 12),
+    subsample = c(0.7, 0.8, 0.9),
+    colsample_bytree = c(0.7, 0.8, 0.9),
+    learning_rate = c(0.05, 0.1, 0.15),
+    min_child_samples = c(5, 10, 20),
+    reg_alpha = c(0, 0.1, 0.5),
+    reg_lambda = c(0, 0.1, 0.5)
+  )
+}
+
+.tune_lgb_cv <- function(X_train, y_train, nfold = 3, early_stopping_rounds = 30, seed = 42, verbose = FALSE) {
+  set.seed(seed)
+  
+  grid_params <- .build_lgb_param_grid()
+  n <- nrow(grid_params)
+  
+  output_df <- data.frame(
+    best_iter = numeric(n),
+    train_rmse = numeric(n),
+    valid_rmse = numeric(n),
+    stringsAsFactors = FALSE
+  )
+  
+  for (i in 1:n) {
+    prm <- list(
+      objective = "regression",
+      metric = "rmse",
+      num_leaves = grid_params$num_leaves[i],
+      max_depth = grid_params$max_depth[i],
+      learning_rate = grid_params$learning_rate[i],
+      subsample = grid_params$subsample[i],
+      colsample_bytree = grid_params$colsample_bytree[i],
+      min_child_samples = grid_params$min_child_samples[i],
+      reg_alpha = grid_params$reg_alpha[i],
+      reg_lambda = grid_params$reg_lambda[i],
+      verbose = -1
+    )
+    
+    lgb_data <- lgb.Dataset(data = X_train, label = y_train)
+    
+    fit <- tryCatch({
+      lgb.cv(
+        params = prm,
+        data = lgb_data,
+        nfold = nfold,
+        nrounds = grid_params$num_iterations[i],
+        early_stopping_rounds = early_stopping_rounds,
+        verbose = if (verbose) 1 else -1
+      )
+    }, error = function(e) {
+      message("LightGBM CV failed for iteration ", i, ": ", e$message)
+      return(NULL)
+    })
+    
+    if (is.null(fit)) {
+      output_df$best_iter[i] <- NA_real_
+      output_df$train_rmse[i] <- NA_real_
+      output_df$valid_rmse[i] <- NA_real_
+      next
+    }
+    
+    best_it <- fit$best_iter
+    if (is.null(best_it) || length(best_it) == 0 || is.na(best_it)) {
+      best_it <- grid_params$num_iterations[i]
+    }
+    
+    if (!is.null(fit$record_evals) && !is.null(fit$record_evals$valid)) {
+      metric_name <- names(fit$record_evals$valid)[1]
+      
+      eval_vec <- fit$record_evals$valid[[metric_name]]$eval
+      if (is.list(eval_vec)) {
+        eval_vec <- unlist(eval_vec)
+      }
+      eval_vec <- as.numeric(eval_vec)
+      
+      if (best_it <= length(eval_vec)) {
+        output_df$best_iter[i] <- as.numeric(best_it)
+        output_df$valid_rmse[i] <- as.numeric(eval_vec[best_it])
+        
+        if (!is.null(fit$record_evals$train)) {
+          train_eval_vec <- fit$record_evals$train[[metric_name]]$eval
+          if (is.list(train_eval_vec)) {
+            train_eval_vec <- unlist(train_eval_vec)
+          }
+          train_eval_vec <- as.numeric(train_eval_vec)
+          output_df$train_rmse[i] <- as.numeric(train_eval_vec[best_it])
+        } else {
+          output_df$train_rmse[i] <- output_df$valid_rmse[i]
+        }
+      } else {
+        last_idx <- length(eval_vec)
+        output_df$best_iter[i] <- as.numeric(last_idx)
+        output_df$valid_rmse[i] <- as.numeric(eval_vec[last_idx])
+        output_df$train_rmse[i] <- output_df$valid_rmse[i]
+      }
+    } else {
+      output_df$best_iter[i] <- as.numeric(best_it)
+      output_df$train_rmse[i] <- NA_real_
+      output_df$valid_rmse[i] <- NA_real_
+    }
+  }
+  
+  valid_runs <- !is.na(output_df$valid_rmse) & is.finite(output_df$valid_rmse)
+  if (sum(valid_runs) == 0) {
+    stop("All LightGBM CV runs failed. Check your data and parameters.")
+  }
+  
+  results_df <- cbind(grid_params, output_df)[valid_runs, , drop = FALSE]
+  results_df$valid_rmse <- as.numeric(results_df$valid_rmse)
+  
+  best_params <- results_df[which.min(results_df$valid_rmse), , drop = FALSE]
+  
+  list(
+    params = list(
+      objective = "regression",
+      metric = "rmse",
+      num_leaves = best_params$num_leaves[1],
+      max_depth = best_params$max_depth[1],
+      learning_rate = best_params$learning_rate[1],
+      subsample = best_params$subsample[1],
+      colsample_bytree = best_params$colsample_bytree[1],
+      verbose = -1
+    ),
+    num_iterations = best_params$num_iterations[1],
+    best_iteration = best_params$best_iter[1],
+    grid_summary = cbind(grid_params, output_df)
+  )
+}
+
+.train_lgb_for_target <- function(train_df, val_df, feat_names, target_name) {
+  X_train <- .build_feature_matrix(train_df, feat_names)
+  y_train <- train_df[[target_name]]
+  
+  wt_train <- NULL
+  if ("w" %in% names(train_df)) {
+    wt_train <- train_df$w
+    wt_train[!is.finite(wt_train)] <- 1.0
+    wt_train <- pmax(wt_train, 1e-6)
+  }
+  
+  X_val <- .build_feature_matrix(val_df, feat_names)
+  y_val <- val_df[[target_name]]
+  
+  wt_val <- NULL
+  if ("w" %in% names(val_df)) {
+    wt_val <- val_df$w
+    wt_val[!is.finite(wt_val)] <- 1.0
+    wt_val <- pmax(wt_val, 1e-6)
+  }
+  
+  # FAST: Use proven good hyperparameters (no grid search)
+  tuned <- list(
+    params = list(
+      objective = "regression",
+      metric = "rmse",
+      num_leaves = 63,
+      max_depth = 8,
+      learning_rate = 0.1,
+      subsample = 0.8,
+      colsample_bytree = 0.8,
+      min_child_samples = 10,
+      reg_alpha = 0.1,
+      reg_lambda = 0.1,
+      verbose = -1
+    ),
+    num_iterations = 400,
+    best_iteration = 400
+  )
+  
+  if (!is.null(wt_train)) {
+    stopifnot(all(is.finite(wt_train)), all(wt_train > 0))
+  }
+  
+  lgb_train <- lgb.Dataset(data = X_train, label = y_train, weight = wt_train)
+  lgb_val <- lgb.Dataset.create.valid(lgb_train, data = X_val, label = y_val, weight = wt_val)
+  
+  model <- lgb.train(
+    params = tuned$params,
+    data = lgb_train,
+    nrounds = 600,
+    valids = list(val = lgb_val),
+    early_stopping_rounds = 50,
+    verbose = -1
+  )
+  
+  importance_df <- lgb.importance(model, percentage = TRUE)
+  
+  pred_val <- predict(model, X_val)
+  rmse_val <- sqrt(mean((y_val - pred_val)^2, na.rm = TRUE))
+  
+  list(model = model, tuned = tuned, feat_names = feat_names,
+       val_rmse = rmse_val, importance = importance_df)
+}
+
+# ==========================================================
+# Ensemble Prediction Functions
+# ==========================================================
+
+.predict_xy_ensemble <- function(val_df, xgb_dx, xgb_dy, lgb_dx, lgb_dy, 
+                                 ref_x_col, ref_y_col, weight_xgb = 0.5) {
+  X_val_dx_xgb <- .build_feature_matrix(val_df, xgb_dx$feat_names)
+  X_val_dy_xgb <- .build_feature_matrix(val_df, xgb_dy$feat_names)
+  
+  dx_xgb <- as.numeric(predict(xgb_dx$model, xgb.DMatrix(X_val_dx_xgb)))
+  dy_xgb <- as.numeric(predict(xgb_dy$model, xgb.DMatrix(X_val_dy_xgb)))
+  
+  X_val_dx_lgb <- .build_feature_matrix(val_df, lgb_dx$feat_names)
+  X_val_dy_lgb <- .build_feature_matrix(val_df, lgb_dy$feat_names)
+  
+  dx_lgb <- predict(lgb_dx$model, X_val_dx_lgb)
+  dy_lgb <- predict(lgb_dy$model, X_val_dy_lgb)
+  
+  weight_lgb <- 1 - weight_xgb
+  dx_ensemble <- weight_xgb * dx_xgb + weight_lgb * dx_lgb
+  dy_ensemble <- weight_xgb * dy_xgb + weight_lgb * dy_lgb
+  
+  data.table(
+    pred_x = val_df[[ref_x_col]] + dx_ensemble,
+    pred_y = val_df[[ref_y_col]] + dy_ensemble
+  )
+}
+
+.tune_ensemble_weight <- function(val_df, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+                                  ref_x_col, ref_y_col,
+                                  w_grid = seq(0, 1, by = 0.05)) {
+  best_rmse <- Inf
+  best_w    <- 0.5
+  
+  for (w in w_grid) {
+    pred <- .predict_xy_ensemble(
+      val_df, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+      ref_x_col, ref_y_col,
+      weight_xgb = w
+    )
+    rmse_w <- rmse_xy(cbind(val_df, pred))
+    if (is.finite(rmse_w) && rmse_w < best_rmse) {
+      best_rmse <- rmse_w
+      best_w    <- w
+    }
+  }
+  
+  list(best_w = best_w, best_rmse = best_rmse)
+}
+
+.predict_xy_from_models <- function(val_df, model_dx, model_dy, ref_x_col, ref_y_col) {
+  X_val_dx <- .build_feature_matrix(val_df, model_dx$feat_names)
+  X_val_dy <- .build_feature_matrix(val_df, model_dy$feat_names)
+  
+  dx <- as.numeric(predict(model_dx$model, xgb.DMatrix(X_val_dx)))
+  dy <- as.numeric(predict(model_dy$model, xgb.DMatrix(X_val_dy)))
+  
+  data.table(
+    pred_x = val_df[[ref_x_col]] + dx,
+    pred_y = val_df[[ref_y_col]] + dy
+  )
+}
+
+split_by_game <- function(input_dt,
+                          val_frac  = CFG$cv_games_val_frac,
+                          test_frac = CFG$cv_games_test_frac) {
+  stopifnot("game_id" %in% names(input_dt))
+  games <- sort(unique(input_dt$game_id))
+  set.seed(CFG$seed)
+  games <- sample(games)
+  
+  n <- length(games)
+  n_val  <- max(0, min(n, ceiling(n * val_frac)))
+  n_test <- max(0, min(n - n_val, ceiling(n * test_frac)))
+  n_train <- max(1, n - n_val - n_test)
+  
+  list(
+    train = games[seq_len(n_train)],
+    val   = if (n_val  > 0) games[(n_train + 1):(n_train + n_val)] else integer(),
+    test  = if (n_test > 0) games[(n_train + n_val + 1):n]        else integer()
+  )
+}
+
+
+rmse_xy <- function(dt, px = "pred_x", py = "pred_y") {
+  dx2_dy2 <- (dt[[px]] - dt$x_tgt)^2 + (dt[[py]] - dt$y_tgt)^2
+  sqrt(mean(dx2_dy2, na.rm = TRUE) / 2)
+}
+
+
+predict_cv <- function(df, s_col, dir_col, x_col, y_col) {
+  vx <- df[[s_col]] * cos(df[[dir_col]] * pi/180) * 0.1
+  vy <- df[[s_col]] * sin(df[[dir_col]] * pi/180) * 0.1
+  t  <- pmax(df$frame_since_release, 0)
+  data.table(
+    pred_x = df[[x_col]] + t * vx,
+    pred_y = df[[y_col]] + t * vy
+  )
+}
+
+blend_preds <- function(pred_a, pred_b, w_a = 0.5, w_b = 1 - w_a) {
+  stopifnot(nrow(pred_a) == nrow(pred_b))
+  data.table(
+    pred_x = w_a * pred_a$pred_x + w_b * pred_b$pred_x,
+    pred_y = w_a * pred_a$pred_y + w_b * pred_b$pred_y
+  )
+}
+
+# ==========================================================
+# WR Cross-Validation with Ensemble
+# ==========================================================
+
+run_cv_once <- function(weeks = CFG$train_weeks, use_test_set = TRUE) {
+  D <- load_train(weeks)
+  splits <- split_by_game(D$input)
+  
+  build_side <- function(side_games, pri_games = NULL) {
+    # 1) build tracking-based window features
+    fe <- build_window_examples(D$input[game_id %in% side_games])
+    
+    # 2) OPTIONAL: attach external context (down, ydstogo, yardline_100, etc.)
+    if (CFG$use_external) {
+      fe <- add_external_context(fe)
+    }
+    
+    # 3) attach priors - ALWAYS use training games only
+    if (is.null(pri_games)) {
+      pri_games <- if (length(splits$train) > 0) splits$train else side_games
+    }
+    fe <- attach_priors(fe, compute_priors(D$input[game_id %in% pri_games]))
+    build_train_rows(D$input[game_id %in% side_games], D$output, fe)
+  }
+  
+  # Build train and val sets
+  trn <- build_side(splits$train, pri_games = splits$train)
+  val <- build_side(splits$val, pri_games = splits$train)
+  
+  trn[, dx := x_tgt - wr_rel_x]
+  trn[, dy := y_tgt - wr_rel_y]
+  val[, dx := x_tgt - wr_rel_x]
+  val[, dy := y_tgt - wr_rel_y]
+  
+  # frame-based weighting
+  safe_make_weights <- function(DT) {
+    DT[, rel_t_raw := pmax(frame_since_release, 0)]
+    DT[, rel_t_den := max(rel_t_raw, na.rm = TRUE), by = .(game_id, play_id, nfl_id)]
+    DT[, rel_t := fifelse(
+      is.finite(rel_t_den) & rel_t_den > 0,
+      rel_t_raw / rel_t_den,
+      0
+    )]
+    
+    DT[, w :=
+         fifelse(rel_t <= 0.1, 1.0,
+                 fifelse(rel_t <= 0.3, 1.5,
+                         fifelse(rel_t <= 0.6, 3.0,
+                                 fifelse(rel_t <= 0.9, 2.0, 0.8))))]
+    
+    DT[, c("rel_t_raw","rel_t_den") := NULL]
+    invisible(DT)
+  }
+  safe_make_weights(trn)
+  safe_make_weights(val)
+  
+  trn[, w_dx := w]
+  trn[, w_dy := w]
+  val[, w_dx := w]
+  val[, w_dy := w]
+  
+  feat_names <- .build_feat_names()
+  
+  message("Tuning WR Δx model (XGBoost)...")
+  trn_dx <- data.table::copy(trn); val_dx <- data.table::copy(val)
+  trn_dx[, w := w_dx]; val_dx[, w := w_dx]
+  xgb_dx <- .train_xgb_for_target(trn_dx, val_dx, feat_names, "dx")
+  
+  message("Tuning WR Δy model (XGBoost)...")
+  trn_dy <- data.table::copy(trn); val_dy <- data.table::copy(val)
+  trn_dy[, w := w_dy]; val_dy[, w := w_dy]
+  xgb_dy <- .train_xgb_for_target(trn_dy, val_dy, feat_names, "dy")
+  
+  message("Tuning WR Δx model (LightGBM)...")
+  lgb_dx <- .train_lgb_for_target(trn_dx, val_dx, feat_names, "dx")
+  
+  message("Tuning WR Δy model (LightGBM)...")
+  lgb_dy <- .train_lgb_for_target(trn_dy, val_dy, feat_names, "dy")
+  
+  base_val  <- predict_cv(val, "wr_rel_s", "wr_rel_dir", "wr_rel_x", "wr_rel_y")
+  rmse_base <- rmse_xy(cbind(val, base_val))
+  
+  xgb_pred <- .predict_xy_from_models(val, xgb_dx, xgb_dy, "wr_rel_x", "wr_rel_y")
+  rmse_xgb <- rmse_xy(cbind(val, xgb_pred))
+  
+  lgb_pred <- data.table(
+    pred_x = val$wr_rel_x + predict(lgb_dx$model, .build_feature_matrix(val, lgb_dx$feat_names)),
+    pred_y = val$wr_rel_y + predict(lgb_dy$model, .build_feature_matrix(val, lgb_dy$feat_names))
+  )
+  rmse_lgb <- rmse_xy(cbind(val, lgb_pred))
+  
+  # tune XGB vs LGB weight for WR
+  ens_tuned <- .tune_ensemble_weight(
+    val, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+    "wr_rel_x", "wr_rel_y"
+  )
+  ensemble_pred <- .predict_xy_ensemble(
+    val, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+    "wr_rel_x", "wr_rel_y",
+    weight_xgb = ens_tuned$best_w
+  )
+  rmse_ensemble <- ens_tuned$best_rmse
+  val_with_pred <- cbind(val, ensemble_pred)
+  
+  future_only_rmse <- function(dt_preds) {
+    last <- max(dt_preds$frame_id, na.rm=TRUE)
+    fut  <- dt_preds[frame_id >= ceiling(0.5 * last)]
+    dx2_dy2 <- (fut$pred_x - fut$x_tgt)^2 + (fut$pred_y - fut$y_tgt)^2
+    sqrt(mean(dx2_dy2, na.rm = TRUE) / 2)
+  }
+  rmse_future <- future_only_rmse(val_with_pred)
+  
+  blend    <- blend_preds(base_val, ensemble_pred, w_a = 0.2, w_b = 0.8)
+  rmse_bl  <- rmse_xy(cbind(val, blend))
+  
+  summarize_rmse_by_player <- function(vp) {
+    if (!all(c("nfl_id","pred_x","pred_y","x_tgt","y_tgt") %in% names(vp))) return(tibble())
+    vp[, .(
+      n_frames = .N,
+      rmse = sqrt(mean((pred_x - x_tgt)^2 + (pred_y - y_tgt)^2, na.rm = TRUE))
+    ), by = nfl_id][order(rmse)]
+  }
+  by_wr <- summarize_rmse_by_player(val_with_pred)
+  
+  # ========================================
+  # NEW: EVALUATE ON TRUE TEST SET
+  # ========================================
+  test_results <- NULL
+  if (use_test_set && length(splits$test) > 0) {
+    message("\n=== EVALUATING ON HOLDOUT TEST SET ===")
+    
+    # Build test set using TRAINING priors (no leakage)
+    test <- build_side(splits$test, pri_games = splits$train)
+    test[, dx := x_tgt - wr_rel_x]
+    test[, dy := y_tgt - wr_rel_y]
+    safe_make_weights(test)
+    
+    # Predict on test set using already-trained models
+    base_test <- predict_cv(test, "wr_rel_s", "wr_rel_dir", "wr_rel_x", "wr_rel_y")
+    rmse_base_test <- rmse_xy(cbind(test, base_test))
+    
+    xgb_test_pred <- .predict_xy_from_models(test, xgb_dx, xgb_dy, "wr_rel_x", "wr_rel_y")
+    rmse_xgb_test <- rmse_xy(cbind(test, xgb_test_pred))
+    
+    lgb_test_pred <- data.table(
+      pred_x = test$wr_rel_x + predict(lgb_dx$model, .build_feature_matrix(test, lgb_dx$feat_names)),
+      pred_y = test$wr_rel_y + predict(lgb_dy$model, .build_feature_matrix(test, lgb_dy$feat_names))
+    )
+    rmse_lgb_test <- rmse_xy(cbind(test, lgb_test_pred))
+    
+    # Use ensemble weight from validation (no re-tuning on test!)
+    ensemble_test_pred <- .predict_xy_ensemble(
+      test, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+      "wr_rel_x", "wr_rel_y",
+      weight_xgb = ens_tuned$best_w
+    )
+    rmse_ensemble_test <- rmse_xy(cbind(test, ensemble_test_pred))
+    
+    blend_test <- blend_preds(base_test, ensemble_test_pred, w_a = 0.2, w_b = 0.8)
+    rmse_bl_test <- rmse_xy(cbind(test, blend_test))
+    
+    test_results <- tibble(
+      model = c("baseline_cv", "xgb_pair", "lgb_pair", "ensemble (XGB+LGB)", "blend_cv_ensemble"),
+      test_rmse = c(rmse_base_test, rmse_xgb_test, rmse_lgb_test, rmse_ensemble_test, rmse_bl_test)
+    )
+    
+    message(sprintf("VAL Ensemble RMSE: %.3f", rmse_ensemble))
+    message(sprintf("TEST Ensemble RMSE: %.3f", rmse_ensemble_test))
+    message(sprintf("Gap (TEST - VAL): %.3f", rmse_ensemble_test - rmse_ensemble))
+  }
+  
+  list(
+    summary = tibble(
+      model = c(
+        "baseline_cv",
+        paste0("xgb_dx tuned it=", xgb_dx$tuned$best_iteration),
+        paste0("xgb_dy tuned it=", xgb_dy$tuned$best_iteration),
+        "xgb_pair",
+        paste0("lgb_dx tuned it=", lgb_dx$tuned$best_iteration),
+        paste0("lgb_dy tuned it=", lgb_dy$tuned$best_iteration),
+        "lgb_pair",
+        "ensemble (XGB+LGB)",
+        "blend_cv_ensemble"
+      ),
+      val_rmse = c(
+        rmse_base,
+        xgb_dx$val_rmse,
+        xgb_dy$val_rmse,
+        rmse_xgb,
+        lgb_dx$val_rmse,
+        lgb_dy$val_rmse,
+        rmse_lgb,
+        rmse_ensemble,
+        rmse_bl
+      )
+    ),
+    test_summary = test_results,  # NEW
+    val_with_pred = val_with_pred,
+    xgb_dx        = xgb_dx,
+    xgb_dy        = xgb_dy,
+    lgb_dx        = lgb_dx,
+    lgb_dy        = lgb_dy,
+    by_wr         = by_wr,
+    rmse_future   = rmse_future
+  )
+}
+
+#CFG$train_weeks <- 1:3
+#res <- run_cv_once(weeks = CFG$train_weeks)
+#print(res$summary)
+
+run_cv_multiweeks <- function(week_blocks = list(1:3, 1:10, 1:18)) {
+  out <- lapply(week_blocks, function(wks) {
+    message("Running WR CV for weeks: ", paste(wks, collapse = ", "))
+    res <- run_cv_once(weeks = wks)
+    tibble(weeks = paste(range(wks), collapse = "-")) %>%
+      bind_cols(res$summary)
+  })
+  bind_rows(out)
+}
+
+# ==========================================================
+# CB Cross-Validation with Ensemble
+# ==========================================================
+
+run_cv_once_cb <- function(weeks = CFG$train_weeks, use_test_set = TRUE) {
+  D <- load_train(weeks)
+  splits <- split_by_game(D$input)
+  
+  build_side <- function(side_games, pri_games = NULL) {
+    # 1) tracking-based CB window features
+    fe <- build_window_examples_cb(D$input[game_id %in% side_games])
+    
+    # 2) OPTIONAL: attach external context (down, distance, field pos)
+    if (CFG$use_external) {
+      fe <- add_external_context(fe)
+    }
+    
+    # 3) attach priors - ALWAYS use training games only
+    if (is.null(pri_games)) {
+      pri_games <- if (length(splits$train) > 0) splits$train else side_games
+    }
+    fe <- attach_priors_cb(fe, compute_priors_cb(D$input[game_id %in% pri_games]))
+    build_train_rows_cb(D$input[game_id %in% side_games], D$output, fe)
+  }
+  
+  trn <- build_side(splits$train, pri_games = splits$train)
+  val <- build_side(splits$val, pri_games = splits$train)
+  
+  trn[, dx := x_tgt - cb_rel_x]
+  trn[, dy := y_tgt - cb_rel_y]
+  val[, dx := x_tgt - cb_rel_x]
+  val[, dy := y_tgt - cb_rel_y]
+  
+  safe_make_weights <- function(DT) {
+    DT[, rel_t_raw := pmax(frame_since_release, 0)]
+    DT[, rel_t_den := max(rel_t_raw, na.rm = TRUE), by = .(game_id, play_id, nfl_id)]
+    DT[, rel_t := fifelse(
+      is.finite(rel_t_den) & rel_t_den > 0,
+      rel_t_raw / rel_t_den,
+      0
+    )]
+    
+    DT[, w :=
+         fifelse(rel_t <= 0.1, 1.0,
+                 fifelse(rel_t <= 0.3, 1.5,
+                         fifelse(rel_t <= 0.6, 3.0,
+                                 fifelse(rel_t <= 0.9, 2.0, 0.8))))]
+    
+    DT[, c("rel_t_raw","rel_t_den") := NULL]
+    invisible(DT)
+  }
+  safe_make_weights(trn)
+  safe_make_weights(val)
+  
+  base_val  <- predict_cv(val, "cb_rel_s", "cb_rel_dir", "cb_rel_x", "cb_rel_y")
+  rmse_base <- rmse_xy(cbind(val, base_val))
+  
+  feat_names <- .build_feat_names_cb()
+  
+  message("Tuning CB Δx model (XGBoost)...")
+  xgb_dx <- .train_xgb_for_target(trn, val, feat_names, "dx")
+  
+  message("Tuning CB Δy model (XGBoost)...")
+  xgb_dy <- .train_xgb_for_target(trn, val, feat_names, "dy")
+  
+  message("Tuning CB Δx model (LightGBM)...")
+  lgb_dx <- .train_lgb_for_target(trn, val, feat_names, "dx")
+  
+  message("Tuning CB Δy model (LightGBM)...")
+  lgb_dy <- .train_lgb_for_target(trn, val, feat_names, "dy")
+  
+  xgb_pred <- .predict_xy_from_models(val, xgb_dx, xgb_dy, "cb_rel_x", "cb_rel_y")
+  rmse_xgb <- rmse_xy(cbind(val, xgb_pred))
+  
+  lgb_pred <- data.table(
+    pred_x = val$cb_rel_x + predict(lgb_dx$model, .build_feature_matrix(val, lgb_dx$feat_names)),
+    pred_y = val$cb_rel_y + predict(lgb_dy$model, .build_feature_matrix(val, lgb_dy$feat_names))
+  )
+  rmse_lgb <- rmse_xy(cbind(val, lgb_pred))
+  
+  ens_tuned <- .tune_ensemble_weight(
+    val, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+    "cb_rel_x", "cb_rel_y"
+  )
+  ensemble_pred <- .predict_xy_ensemble(
+    val, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+    "cb_rel_x", "cb_rel_y",
+    weight_xgb = ens_tuned$best_w
+  )
+  rmse_ensemble <- ens_tuned$best_rmse
+  
+  future_only_rmse <- function(dt_preds) {
+    last <- max(dt_preds$frame_id, na.rm=TRUE)
+    fut  <- dt_preds[frame_id >= ceiling(0.5 * last)]
+    dx2_dy2 <- (fut$pred_x - fut$x_tgt)^2 + (fut$pred_y - fut$y_tgt)^2
+    sqrt(mean(dx2_dy2, na.rm = TRUE) / 2)
+  }
+  rmse_future <- future_only_rmse(cbind(val, ensemble_pred))
+  
+  blend    <- blend_preds(base_val, ensemble_pred, w_a = 0.2, w_b = 0.8)
+  rmse_bl  <- rmse_xy(cbind(val, blend))
+  
+  val_with_pred <- cbind(val, ensemble_pred)
+ 
+  test_results <- NULL
+  if (use_test_set && length(splits$test) > 0) {
+    message("\n=== EVALUATING CB ON HOLDOUT TEST SET ===")
+    
+    test <- build_side(splits$test, pri_games = splits$train)
+    test[, dx := x_tgt - cb_rel_x]
+    test[, dy := y_tgt - cb_rel_y]
+    safe_make_weights(test)
+    
+    base_test <- predict_cv(test, "cb_rel_s", "cb_rel_dir", "cb_rel_x", "cb_rel_y")
+    rmse_base_test <- rmse_xy(cbind(test, base_test))
+    
+    xgb_test_pred <- .predict_xy_from_models(test, xgb_dx, xgb_dy, "cb_rel_x", "cb_rel_y")
+    rmse_xgb_test <- rmse_xy(cbind(test, xgb_test_pred))
+    
+    lgb_test_pred <- data.table(
+      pred_x = test$cb_rel_x + predict(lgb_dx$model, .build_feature_matrix(test, lgb_dx$feat_names)),
+      pred_y = test$cb_rel_y + predict(lgb_dy$model, .build_feature_matrix(test, lgb_dy$feat_names))
+    )
+    rmse_lgb_test <- rmse_xy(cbind(test, lgb_test_pred))
+    
+    ensemble_test_pred <- .predict_xy_ensemble(
+      test, xgb_dx, xgb_dy, lgb_dx, lgb_dy,
+      "cb_rel_x", "cb_rel_y",
+      weight_xgb = ens_tuned$best_w
+    )
+    rmse_ensemble_test <- rmse_xy(cbind(test, ensemble_test_pred))
+    
+    blend_test <- blend_preds(base_test, ensemble_test_pred, w_a = 0.2, w_b = 0.8)
+    rmse_bl_test <- rmse_xy(cbind(test, blend_test))
+    
+    test_results <- tibble(
+      model = c("baseline_cv", "xgb_pair", "lgb_pair", "ensemble (XGB+LGB)", "blend_cv_ensemble"),
+      test_rmse = c(rmse_base_test, rmse_xgb_test, rmse_lgb_test, rmse_ensemble_test, rmse_bl_test)
+    )
+    
+    message(sprintf("VAL Ensemble RMSE: %.3f", rmse_ensemble))
+    message(sprintf("TEST Ensemble RMSE: %.3f", rmse_ensemble_test))
+    message(sprintf("Gap (TEST - VAL): %.3f", rmse_ensemble_test - rmse_ensemble))
+  }
+  
+  list(
+    summary = tibble(
+      model = c(
+        "baseline_cv",
+        paste0("xgb_dx tuned it=", xgb_dx$tuned$best_iteration),
+        paste0("xgb_dy tuned it=", xgb_dy$tuned$best_iteration),
+        "xgb_pair",
+        paste0("lgb_dx tuned it=", lgb_dx$tuned$best_iteration),
+        paste0("lgb_dy tuned it=", lgb_dy$tuned$best_iteration),
+        "lgb_pair",
+        "ensemble (XGB+LGB)",
+        "blend_cv_ensemble"
+      ),
+      val_rmse = c(
+        rmse_base,
+        xgb_dx$val_rmse,
+        xgb_dy$val_rmse,
+        rmse_xgb,
+        lgb_dx$val_rmse,
+        lgb_dy$val_rmse,
+        rmse_lgb,
+        rmse_ensemble,
+        rmse_bl
+      )
+    ),
+    test_summary = test_results,  # NEW
+    val_with_pred = val_with_pred,
+    xgb_dx        = xgb_dx,
+    xgb_dy        = xgb_dy,
+    lgb_dx        = lgb_dx,
+    lgb_dy        = lgb_dy,
+    rmse_future   = rmse_future
+  )
+}
+
+#CFG$train_weeks <- 1:3
+#res <- run_cv_once_cb(weeks = CFG$train_weeks)
+#print(res$summary)
+
+run_cv_multiweeks_cb <- function(week_blocks = list(1:3, 1:10, 1:18)) {
+  out <- lapply(week_blocks, function(wks) {
+    message("Running CB CV for weeks: ", paste(wks, collapse = ", "))
+    res <- run_cv_once_cb(weeks = wks)
+    tibble(weeks = paste(range(wks), collapse = "-")) %>%
+      bind_cols(res$summary)
+  })
+  bind_rows(out)
+}
+
+# ==========================================================
+# COMBINED RUN - WR and CB Together
+# ==========================================================
+
+run_both_wr_cb <- function(weeks = CFG$train_weeks) {
+  message("\n=== RUNNING WIDE RECEIVER MODEL ===")
+  res_wr <- run_cv_once(weeks = weeks)
+  
+  message("\n=== RUNNING CORNERBACK MODEL ===")
+  res_cb <- run_cv_once_cb(weeks = weeks)
+  
+  combined_summary <- bind_rows(
+    res_wr$summary %>% mutate(player_type = "WR"),
+    res_cb$summary %>% mutate(player_type = "CB")
+  )
+  
+  list(
+    wr = res_wr,
+    cb = res_cb,
+    combined_summary = combined_summary
+  )
+}
+
+# ========================================
+# MAIN EXECUTION WITH TEST SET VALIDATION
+# ========================================
+
+CFG$train_weeks <- 1:18  # Use all weeks for final model
+
+message("\n########## RUNNING WITH TRUE TEST SET VALIDATION ##########\n")
+results <- run_both_wr_cb(weeks = CFG$train_weeks)
+
+message("\n=== COMBINED VALIDATION SUMMARY ===")
+print(results$combined_summary)
+
+message("\n=== WR TEST SET RESULTS ===")
+print(results$wr$test_summary)
+
+message("\n=== CB TEST SET RESULTS ===")
+print(results$cb$test_summary)
+
+message("\n=== PERFORMANCE GAP ANALYSIS ===")
+if (!is.null(results$wr$test_summary)) {
+  wr_gap <- results$wr$test_summary$test_rmse[results$wr$test_summary$model == "ensemble (XGB+LGB)"] - 
+    results$wr$summary$val_rmse[results$wr$summary$model == "ensemble (XGB+LGB)"]
+  message(sprintf("WR Val-Test Gap: %.3f", wr_gap))
+}
+
+if (!is.null(results$cb$test_summary)) {
+  cb_gap <- results$cb$test_summary$test_rmse[results$cb$test_summary$model == "ensemble (XGB+LGB)"] - 
+    results$cb$summary$val_rmse[results$cb$summary$model == "ensemble (XGB+LGB)"]
+  message(sprintf("CB Val-Test Gap: %.3f", cb_gap))
+}
+
+# ==========================================================
+# VISUALIZATION FUNCTIONS
+# ==========================================================
+
+plot_feature_importance <- function(model_result, title) {
+  model_result$importance %>%
+    as.data.frame() %>%
+    arrange(desc(Gain)) %>%
+    head(25) %>%
+    ggplot(aes(x = Gain, y = reorder(Feature, Gain))) +
+    geom_col(fill = "steelblue") +
+    labs(title = title, x = "Gain", y = "Feature") +
+    theme_minimal()
+}
+
+plot_feature_importance_comparison <- function(xgb_result, lgb_result, title_prefix) {
+  xgb_imp <- xgb_result$importance %>%
+    as.data.frame() %>%
+    select(Feature, Gain) %>%
+    head(15) %>%
+    mutate(model = "XGBoost")
+  
+  lgb_imp <- lgb_result$importance %>%
+    as.data.frame() %>%
+    select(Feature, Gain) %>%
+    head(15) %>%
+    mutate(model = "LightGBM")
+  
+  combined <- bind_rows(xgb_imp, lgb_imp)
+  
+  ggplot(combined, aes(x = Gain, y = reorder(Feature, Gain), fill = model)) +
+    geom_col(position = "dodge") +
+    scale_fill_manual(values = c("XGBoost" = "steelblue", "LightGBM" = "coral")) +
+    labs(
+      title = paste(title_prefix, "- Model Comparison"),
+      x = "Gain",
+      y = "Feature",
+      fill = "Model"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+}
+
+plot_frame_rmse <- function(val_with_pred, title) {
+  frame_err <- val_with_pred[, .(
+    rmse = sqrt(mean((pred_x - x_tgt)^2 + (pred_y - y_tgt)^2, na.rm = TRUE))
+  ), by = frame_id]
+  
+  ggplot(frame_err, aes(x = frame_id, y = rmse)) +
+    geom_line(color = "steelblue", linewidth = 1) +
+    geom_point(color = "steelblue", size = 2) +
+    labs(
+      title = title,
+      x = "Frame Since Release",
+      y = "RMSE (yards)"
+    ) +
+    theme_minimal()
+}
+
+plot_play_overlay <- function(val_with_pred, game_id, play_id, player_type = "WR") {
+  gid <- game_id; pid <- play_id
+  df <- val_with_pred[game_id == gid & play_id == pid]
+  if (nrow(df) == 0L) stop("No rows for that game_id/play_id")
+  
+  data.table::setorder(df, frame_id)
+  start_pt <- df[1L]
+  end_pt   <- df[.N]
+  
+  ggplot() +
+    geom_path(data = df, aes(x = x_tgt, y = y_tgt),
+              color = "black", linewidth = 1, linetype = "solid") +
+    geom_path(data = df, aes(x = pred_x, y = pred_y),
+              color = "red", linewidth = 1, linetype = "dashed") +
+    geom_point(data = start_pt, aes(x = x_tgt, y = y_tgt),
+               color = "green", size = 4, shape = 15) +
+    geom_point(data = end_pt, aes(x = x_tgt, y = y_tgt),
+               color = "blue", size = 4, shape = 17) +
+    coord_fixed(xlim = c(0,120), ylim = c(0,53.3)) +
+    labs(
+      title = sprintf("%s: Actual vs Predicted — Game %s, Play %s", player_type, gid, pid),
+      subtitle = "Black=Actual | Red=Predicted | Green=Start | Blue=End",
+      x = "x (yds)", y = "y (yds)"
+    ) +
+    theme_minimal()
+}
+
+analyze_wr_cb_interaction <- function(wr_val, cb_val) {
+  cols <- c("game_id","play_id","frame_id","frame_since_release")
+  wr_cols <- c(cols, "pred_x","pred_y")
+  cb_cols <- c(cols, "pred_x","pred_y")
+  wr_small <- wr_val[, ..wr_cols]
+  setnames(wr_small, c("pred_x","pred_y"), c("pred_x_wr","pred_y_wr"))
+  cb_small <- cb_val[, ..cb_cols]
+  setnames(cb_small, c("pred_x","pred_y"), c("pred_x_cb","pred_y_cb"))
+  m <- merge(wr_small, cb_small, by = cols, all = FALSE)
+  if (nrow(m) == 0L) return(list(summary = tibble(), detail = data.table()))
+  
+  m[, separation_pred := sqrt((pred_x_wr - pred_x_cb)^2 + (pred_y_wr - pred_y_cb)^2)]
+  sep_summary <- m[, .(
+    frames = .N,
+    sep_mean = mean(separation_pred, na.rm=TRUE),
+    sep_sd   = sd(separation_pred, na.rm=TRUE)
+  ), by = .(game_id, play_id)][order(-sep_mean)]
+  
+  list(summary = as_tibble(sep_summary), detail = m)
+}
+
+anchor_sep <- function(detail_dt) {
+  detail_dt[, .(
+    sep_at_0  = separation_pred[frame_since_release == 0][1],
+    sep_at_10 = separation_pred[frame_since_release == 10][1],
+    sep_at_20 = separation_pred[frame_since_release == 20][1]
+  ), by = .(game_id, play_id)]
+}
+
+# ==========================================================
+# ANIMATION FUNCTIONS
+# ==========================================================
+
+DATA_DIR <- "C:/Users/maxal/OneDrive/Documents/data"
+
+ROLE_COLORS <- c(
+  "Targeted Receiver"  = "red",
+  "Passer"             = "blue",
+  "Defensive Coverage" = "yellow",
+  "Other Route Runner" = "lightblue",
+  "Ball"               = "brown"
+)
+
+create_field_layer <- function(start_x = 0, end_x = 120, play_direction = "right") {
+  left_color  <- if (play_direction == "right") "lightblue" else "#f4cccc"
+  right_color <- if (play_direction == "right") "#f4cccc" else "lightblue"
+  
+  yard_lines <- seq(start_x + 10, end_x - 10, by = 10)
+  yard_line_data <- data.frame(x = yard_lines)
+  
+  left_goal <- start_x + 10
+  num_positions <- seq(start_x + 20, end_x - 10, by = 10)
+  yard_labels <- sapply(num_positions, function(p) {
+    d <- p - left_goal
+    as.integer(min(d, 100 - d))
+  })
+  yard_num_data <- data.frame(
+    x = rep(num_positions, 2),
+    y = rep(c(5, 53.3 - 5), each = length(num_positions)),
+    label = rep(yard_labels, 2)
+  )
+  
+  list(
+    annotate("rect", xmin = start_x, xmax = end_x, ymin = 0, ymax = 53.3,
+             fill = "forestgreen", color = "black", linewidth = 1),
+    annotate("rect", xmin = start_x, xmax = start_x + 10, ymin = 0, ymax = 53.3,
+             fill = left_color, alpha = 0.3),
+    annotate("rect", xmin = end_x - 10, xmax = end_x, ymin = 0, ymax = 53.3,
+             fill = right_color, alpha = 0.3),
+    geom_vline(data = yard_line_data, aes(xintercept = x),
+               color = "white", linewidth = 0.8, inherit.aes = FALSE),
+    geom_text(data = yard_num_data, aes(x = x, y = y, label = label),
+              color = "white", size = 4, fontface = "bold", inherit.aes = FALSE),
+    coord_fixed(xlim = c(start_x, end_x), ylim = c(0, 53.3)),
+    theme_void(),
+    theme(
+      plot.background  = element_rect(fill = "white", color = NA),
+      panel.background = element_rect(fill = "forestgreen", color = NA),
+      legend.position  = "top"
+    )
+  )
+}
+
+animate_play <- function(game_id, play_id, df_in, df_out,
+                         show_output = TRUE, subsample = 1,
+                         orientation_length = 1.5,
+                         add_ball_marker = TRUE,
+                         ball_travel = TRUE) {
+  
+  in_play <- df_in %>%
+    filter(game_id == !!game_id, play_id == !!play_id) %>%
+    arrange(frame_id) %>%
+    as_tibble()
+  
+  out_play <- df_out %>%
+    filter(game_id == !!game_id, play_id == !!play_id) %>%
+    arrange(frame_id) %>%
+    as_tibble()
+  
+  play_dir <- in_play$play_direction[1] %||% "right"
+  
+  if (subsample > 1) {
+    in_play  <- in_play  %>% filter(frame_id %% subsample == 0)
+    out_play <- out_play %>% filter(frame_id %% subsample == 0)
+  }
+  
+  in_play <- in_play %>%
+    mutate(
+      role_mapped = ifelse(player_role %in% names(ROLE_COLORS), player_role, "Other"),
+      color = dplyr::case_when(
+        role_mapped %in% names(ROLE_COLORS) ~ ROLE_COLORS[role_mapped],
+        TRUE ~ "gray"
+      )
+    )
+  
+  release_frame <- max(in_play$frame_id, na.rm = TRUE)
+  in_play <- in_play %>% mutate(frame_idx = frame_id)
+  
+  out_with_role <- NULL
+  if (show_output && nrow(out_play) > 0) {
+    out_with_role <- out_play %>%
+      left_join(in_play %>% distinct(game_id, play_id, nfl_id, player_role),
+                by = c("game_id", "play_id", "nfl_id")) %>%
+      mutate(
+        role_mapped = ifelse(player_role %in% names(ROLE_COLORS), player_role, "Other"),
+        color = dplyr::case_when(
+          role_mapped %in% names(ROLE_COLORS) ~ ROLE_COLORS[role_mapped],
+          TRUE ~ "gray"
+        ),
+        o = NA_real_,
+        frame_idx = frame_id + release_frame
+      )
+  }
+  
+  ball_frames <- NULL
+  if (add_ball_marker && (nrow(out_with_role) > 0)) {
+    ball_x_land <- in_play$ball_land_x[1]
+    ball_y_land <- in_play$ball_land_y[1]
+    
+    rel_rows <- in_play %>% filter(frame_id == release_frame)
+    qb_rel <- rel_rows %>% filter(player_role == "Passer") %>% slice_head(n = 1)
+    if (nrow(qb_rel) == 0) qb_rel <- rel_rows %>% filter(player_role == "Targeted Receiver") %>% slice_head(n = 1)
+    if (nrow(qb_rel) == 0) qb_rel <- rel_rows %>% slice_head(n = 1)
+    
+    x0 <- qb_rel$x; y0 <- qb_rel$y
+    
+    if (ball_travel && is.finite(ball_x_land) && is.finite(ball_y_land)) {
+      out_frames <- sort(unique(out_with_role$frame_idx))
+      n_out <- length(out_frames)
+      t <- seq_len(n_out) / n_out
+      bx <- x0 + t * (ball_x_land - x0)
+      by <- y0 + t * (ball_y_land - y0) + 0.5 * sin(pi * t)
+      
+      ball_frames <- data.frame(
+        game_id, play_id,
+        frame_id  = out_frames - release_frame,
+        frame_idx = out_frames,
+        nfl_id = "BALL",
+        x = bx, y = by,
+        player_role = "Ball",
+        color = ROLE_COLORS[["Ball"]],
+        o = NA_real_
+      )
+    } else {
+      ball_frames <- data.frame(
+        game_id, play_id,
+        frame_id   = sort(unique(out_with_role$frame_id)),
+        frame_idx  = sort(unique(out_with_role$frame_idx)),
+        nfl_id     = "BALL",
+        x = ball_x_land, y = ball_y_land,
+        player_role = "Ball",
+        color = ROLE_COLORS[["Ball"]],
+        o = NA_real_
+      )
+    }
+  }
+  
+  all_frames <- bind_rows(
+    in_play %>% mutate(nfl_id = as.character(nfl_id)),
+    out_with_role %>% mutate(nfl_id = as.character(nfl_id)),
+    ball_frames %>% mutate(nfl_id = as.character(nfl_id))
+  ) %>%
+    arrange(frame_idx, nfl_id) %>%
+    mutate(
+      x_end = ifelse(!is.na(o), x + orientation_length * sin(o * pi / 180), NA_real_),
+      y_end = ifelse(!is.na(o), y + orientation_length * cos(o * pi / 180), NA_real_),
+      id_label = as.character(nfl_id)
+    )
+  
+  p <- ggplot(all_frames, aes(x = x, y = y)) +
+    create_field_layer(play_direction = play_dir) +
+    geom_point(
+      aes(color = color, shape = ifelse(nfl_id == "BALL", "Ball", "Player")),
+      size = 3, show.legend = FALSE
+    ) +
+    geom_text(
+      data = subset(all_frames, nfl_id != "BALL"),
+      aes(label = player_name),
+      size = 2.5, vjust = -1, fontface = "bold", color = "white",
+      check_overlap = TRUE
+    ) +
+    geom_segment(
+      aes(xend = x_end, yend = y_end, color = color),
+      arrow = arrow(length = unit(0.15, "cm")),
+      linewidth = 0.6, na.rm = TRUE
+    ) +
+    scale_color_identity() +
+    scale_shape_manual(values = c("Player" = 16, "Ball" = 4), guide = "none") +
+    labs(
+      title = sprintf("Game %s | Play %s", game_id, play_id),
+      subtitle = "Frame: {closest_state}"
+    ) +
+    transition_states(frame_idx, transition_length = 1, state_length = 1) +
+    ease_aes("linear")
+  
+  nframes <- length(unique(all_frames$frame_idx))
+  animate(p, nframes = max(1, nframes), fps = 10, width = 1200, height = 533, res = 120)
+}
+
+load_all_data_for_animation <- function() {
+  message("Loading input and output data for animation...")
+  
+  input_files <- list.files(
+    path = DATA_DIR,
+    pattern = "^input_2023_w.*\\.csv$",
+    full.names = TRUE
+  ) %>% sort()
+  
+  output_files <- list.files(
+    path = DATA_DIR,
+    pattern = "^output_2023_w.*\\.csv$",
+    full.names = TRUE
+  ) %>% sort()
+  
+  stopifnot(length(input_files) > 0, length(output_files) > 0)
+  
+  df_in  <- data.table::rbindlist(lapply(input_files, fread), fill = TRUE)
+  df_out <- data.table::rbindlist(lapply(output_files, fread), fill = TRUE)
+  
+  list(input = df_in, output = df_out)
+}
+
+animate_example_play <- function() {
+  anim_data <- load_all_data_for_animation()
+  df_in <- anim_data$input
+  df_out <- anim_data$output
+  
+  games_with_output <- intersect(unique(df_in$game_id), unique(df_out$game_id))
+  GAME_ID <- games_with_output[6]
+  
+  plays_in_game_in  <- df_in  %>% filter(game_id == GAME_ID) %>% distinct(play_id) %>% pull()
+  plays_in_game_out <- df_out %>% filter(game_id == GAME_ID) %>% distinct(play_id) %>% pull()
+  PLAY_ID <- intersect(plays_in_game_in, plays_in_game_out)[6]
+  
+  message(sprintf("\nAnimating Game %s, Play %s", GAME_ID, PLAY_ID))
+  
+  anim <- animate_play(GAME_ID, PLAY_ID, df_in, df_out, subsample = 1, add_ball_marker = TRUE)
+  anim_save("play_animation.gif", animation = anim)
+  
+  message("Animation saved to: play_animation.gif")
+  anim
+}
+
+# ==========================================================
+# EXAMPLE USAGE - RUN ENSEMBLE MODELS
+# ==========================================================
+
+message("\n########## RUNNING WR AND CB ENSEMBLE PREDICTION MODELS ##########\n")
+
+interaction <- analyze_wr_cb_interaction(results$wr$val_with_pred, results$cb$val_with_pred)
+message("\n=== WR–CB Separation Summary (predicted) ===")
+print(head(interaction$summary, 10))
+
+anc <- anchor_sep(interaction$detail)
+print(head(anc, 10))
+
+message("\n=== COMBINED ENSEMBLE SUMMARY ===")
+print(results$combined_summary)
+
+message("\n=== PER-WR RMSE (top 15) ===")
+print(head(results$wr$by_wr, 15))
+name_map <- unique(load_train(CFG$train_weeks)$input[, .(nfl_id, player_name)])
+per_wr_named <- merge(results$wr$by_wr, name_map, by="nfl_id", all.x=TRUE)
+
+message("\n=== WR FEATURE IMPORTANCE ===")
+print(plot_feature_importance(results$wr$xgb_dx, "WR XGBoost Feature Importance — Δx"))
+print(plot_feature_importance(results$wr$xgb_dy, "WR XGBoost Feature Importance — Δy"))
+print(plot_feature_importance_comparison(results$wr$xgb_dx, results$wr$lgb_dx, "WR Δx"))
+print(plot_feature_importance_comparison(results$wr$xgb_dy, results$wr$lgb_dy, "WR Δy"))
+
+message("\n=== CB FEATURE IMPORTANCE ===")
+print(plot_feature_importance(results$cb$xgb_dx, "CB XGBoost Feature Importance — Δx"))
+print(plot_feature_importance(results$cb$xgb_dy, "CB XGBoost Feature Importance — Δy"))
+print(plot_feature_importance_comparison(results$cb$xgb_dx, results$cb$lgb_dx, "CB Δx"))
+print(plot_feature_importance_comparison(results$cb$xgb_dy, results$cb$lgb_dy, "CB Δy"))
+
+message("\n=== PER-FRAME RMSE ===")
+print(plot_frame_rmse(results$wr$val_with_pred, "WR Ensemble RMSE per Frame (Validation Set)"))
+print(plot_frame_rmse(results$cb$val_with_pred, "CB Ensemble RMSE per Frame (Validation Set)"))
+per_wr_named <- merge(results$wr$by_wr, name_map, by="nfl_id", all.x=TRUE)
+print(head(per_wr_named[order(rmse)], 15))
+
+if (nrow(results$wr$val_with_pred) > 0) {
+  one_gid_wr <- results$wr$val_with_pred$game_id[1]
+  one_pid_wr <- results$wr$val_with_pred$play_id[1]
+  print(plot_play_overlay(results$wr$val_with_pred, one_gid_wr, one_pid_wr, "WR"))
+}
+
+if (nrow(results$cb$val_with_pred) > 0) {
+  one_gid_cb <- results$cb$val_with_pred$game_id[1]
+  one_pid_cb <- results$cb$val_with_pred$play_id[1]
+  print(plot_play_overlay(results$cb$val_with_pred, one_gid_cb, one_pid_cb, "CB"))
+}
+
+message("\n=== MULTI-WEEK ENSEMBLE STABILITY TEST ===")
+# ---- WR Multi-week ----
+message("\nWR Multi-week:")
+wr_multi <- run_cv_multiweeks(
+  week_blocks = list(1:3, 1:10, 1:18)
+)   
+print(wr_multi, n = Inf)               
+
+# ---- CB Multi-week ----
+message("\nCB Multi-week:")
+cb_multi <- run_cv_multiweeks_cb(
+  week_blocks = list(1:3, 1:10, 1:18)
+)
+print(cb_multi, n = Inf)    
+
+# Uncomment to run animation:
+#animate_example_play()
+
+# Example: Write submissions
+write_submission(results$wr$val_with_pred, "submission_wr_ensemble.csv")
+write_submission_cb(results$cb$val_with_pred, "submission_cb_ensemble.csv")
+write_combined_submission(results$wr$val_with_pred, results$cb$val_with_pred, "submission_combined_ensemble.csv")
+
+message("\n########## ALL ENSEMBLE MODELS COMPLETE ##########\n")
+```
