@@ -4,7 +4,7 @@ Welcome! I'm a Sports Analytics graduate major at Syracuse University passionate
 
 ---
 
-## 💸 Running Back Value & Role Classification
+## 💸 Running Back Value, Contract-adjusted rankings, & Role Classification
 - Used k-means clustering on usage, efficiency, and game context metrics.
 - Created a normalized Value Score and contract-adjusted rankings.
 - Visualized role-based archetypes and identified market inefficiencies.
